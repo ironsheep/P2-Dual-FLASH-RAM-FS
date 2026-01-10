@@ -218,3 +218,4 @@ CLAUDE.md
 *.lst
 *.map
 pnut-term-settings.json
+/tasks

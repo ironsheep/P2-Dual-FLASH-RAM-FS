@@ -348,7 +348,7 @@ PUB unmount() : status | handle, tmpFlashLock, tmpRamLock, tmpStatus
 '' @returns status - SUCCESS, E_NOT_MOUNTED
 
   ' Check if mounted
-  ifnot flashMounted or ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Acquire locks for exclusive access
@@ -465,7 +465,7 @@ PUB open(p_filename, mode) : handle | device, p_name, fileFound
 '' @returns handle - 0..MAX_FILES_OPEN-1, or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Check handles available
@@ -549,7 +549,7 @@ PUB open_circular(p_filename, mode, max_file_length) : handle | device, p_name, 
 '' @returns handle - handle or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate max_file_length
@@ -622,7 +622,7 @@ PUB close(handle) : status | device
 '' @returns status - SUCCESS or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle
@@ -658,7 +658,7 @@ PUB flush(handle) : status | device
 '' @returns status - SUCCESS or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle
@@ -708,7 +708,7 @@ PUB read(handle, p_buffer, count) : bytes_read | device, status, byte_value
 '' @returns bytes_read - actual bytes read
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     LONG[@errorCode][cogid()] := E_NOT_MOUNTED
     return 0
 
@@ -749,18 +749,18 @@ PUB write(handle, p_buffer, count) : bytes_written | device, status, byte_value
 '' @param handle - file handle
 '' @param p_buffer - source buffer
 '' @param count - bytes to write
-'' @returns bytes_written - actual bytes written
+'' @returns bytes_written - actual bytes written, or error code if negative
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     LONG[@errorCode][cogid()] := E_NOT_MOUNTED
-    return 0
+    return E_NOT_MOUNTED
 
   ' Validate handle and mode (write requires write mode)
   status := ensure_handle_mode(handle, H_WRITE | H_APPEND | H_READWRITE)
   if status <> SUCCESS
     LONG[@errorCode][cogid()] := status
-    return 0
+    return status
 
   device := hDevice[handle]
 
@@ -795,7 +795,7 @@ PUB rd_byte(handle) : byte_value | device, status
 '' @returns byte_value - byte read or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle and mode
@@ -827,7 +827,7 @@ PUB rd_word(handle) : word_value | device, status, lo_byte, hi_byte
 '' @returns word_value - word read or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle and mode
@@ -869,7 +869,7 @@ PUB rd_long(handle) : long_value | device, status, b0, b1, b2, b3
 '' @returns long_value - long read or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle and mode
@@ -921,7 +921,7 @@ PUB rd_str(handle, p_str, count) : bytes_read | device, status, byte_value
 '' @returns bytes_read - bytes read (not including null)
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     LONG[@errorCode][cogid()] := E_NOT_MOUNTED
     return 0
 
@@ -971,7 +971,7 @@ PUB wr_byte(handle, byte_value) : status | device
 '' @returns status - SUCCESS or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle and mode
@@ -1004,7 +1004,7 @@ PUB wr_word(handle, word_value) : status | device
 '' @returns status - SUCCESS or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle and mode
@@ -1041,7 +1041,7 @@ PUB wr_long(handle, long_value) : status | device
 '' @returns status - SUCCESS or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle and mode
@@ -1082,7 +1082,7 @@ PUB wr_str(handle, p_str) : status | device, byte_value
 '' @returns status - SUCCESS or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle and mode
@@ -1127,7 +1127,7 @@ PUB seek(handle, position, whence) : end_position | device, status, file_size_by
 '' @returns end_position - resulting position or error
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle and mode (seek requires read mode)
@@ -1194,7 +1194,7 @@ PUB exists(p_filename) : found | device, p_name
 '' @returns found - true if file exists
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     LONG[@errorCode][cogid()] := E_NOT_MOUNTED
     return false
 
@@ -1223,7 +1223,7 @@ PUB delete(p_filename) : status | device, p_name, signature
 '' @returns status - SUCCESS or error
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Parse drive letter
@@ -1263,7 +1263,7 @@ PUB rename(p_old_filename, p_new_filename) : status | old_device, new_device, p_
 '' @returns status - SUCCESS or error
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Parse drive letters
@@ -1290,11 +1290,6 @@ PUB rename(p_old_filename, p_new_filename) : status | old_device, new_device, p_
   elseif is_file_open_device(old_device, p_new_name, H_READ_WRITE)
     status := (LONG[@errorCode][cogid()] := E_FILE_OPEN)
 
-  ' Check for available space (Flash needs new block for rename)
-  elseif old_device == DRIVE_F
-    ifnot flash_blocks_free()
-      status := (LONG[@errorCode][cogid()] := E_DRIVE_FULL)
-
   ' Check if new file already exists
   elseif get_file_head_signature_device(old_device, p_new_name)
     status := (LONG[@errorCode][cogid()] := E_FILE_EXISTS)
@@ -1303,23 +1298,30 @@ PUB rename(p_old_filename, p_new_filename) : status | old_device, new_device, p_
   elseifnot signature := get_file_head_signature_device(old_device, p_old_name)
     status := (LONG[@errorCode][cogid()] := E_FILE_NOT_FOUND)
 
+  ' Check for available space (Flash needs new block for rename)
+  elseif old_device == DRIVE_F and flash_blocks_free() == 0
+    status := (LONG[@errorCode][cogid()] := E_DRIVE_FULL)
+
   else
     ' Perform the rename
     if old_device == DRIVE_F
       ' Flash rename: write new head block with new filename, cancel old
       new_block_address := flash_allocate_block()
-      cur_block_address := field[FlashIDToBlock][signature.[19..8]]
-      flash_read_block(cur_block_address, @tmpBlockBuffer, $000, $FFF)
-      LONG[@tmpBlockBuffer][1].[31..12] := filename_crc(p_new_name)
-      bytefill(@tmpBlockBuffer + $008, $E5, FILENAME_SIZE)
-      strcopy(@tmpBlockBuffer + $008, p_new_name, FILENAME_SIZE - 1)
-      next_cycle_bits := flash_next_active_cycle(BYTE[@tmpBlockBuffer].[7..5])
-      flash_write_block(new_block_address, @tmpBlockBuffer, next_cycle_bits)
-      flash_activate_block(new_block_address, next_cycle_bits)
-      flash_cancel_block(cur_block_address)
-      field[FlashIDToBlock][signature.[19..8]] := new_block_address
-      field[FlashBlockState][new_block_address] := B_HEAD
-      field[FlashBlockState][cur_block_address] := B_FREE
+      if new_block_address < 0
+        status := (LONG[@errorCode][cogid()] := new_block_address)
+      else
+        cur_block_address := field[FlashIDToBlock][signature.[19..8]]
+        flash_read_block(cur_block_address, @tmpBlockBuffer, $000, $FFF)
+        LONG[@tmpBlockBuffer][1].[31..12] := filename_crc(p_new_name)
+        bytefill(@tmpBlockBuffer + $008, $E5, FILENAME_SIZE)
+        strcopy(@tmpBlockBuffer + $008, p_new_name, FILENAME_SIZE - 1)
+        next_cycle_bits := flash_next_active_cycle(BYTE[@tmpBlockBuffer].[7..5])
+        flash_write_block(new_block_address, @tmpBlockBuffer, next_cycle_bits)
+        flash_activate_block(new_block_address, next_cycle_bits)
+        flash_cancel_block(cur_block_address)
+        field[FlashIDToBlock][signature.[19..8]] := new_block_address
+        field[FlashBlockState][new_block_address] := B_HEAD
+        field[FlashBlockState][cur_block_address] := B_FREE
     else
       ' RAM rename: update filename in place
       cur_block_address := field[RAMIDToBlock][signature.[19..8]]
@@ -1352,7 +1354,7 @@ PUB file_size(p_filename) : size_in_bytes | device, p_name, signature, block_id
 '' @returns size_in_bytes - size or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Parse drive letter
@@ -1388,7 +1390,7 @@ PUB file_size_for_handle(handle) : size_in_bytes | device, status
 '' @returns size_in_bytes - size or error code
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate handle
@@ -1458,7 +1460,7 @@ PUB directory(device, p_block_id, p_filename, p_file_size) : status | block_id, 
 '' @returns status - SUCCESS if file found, E_END_OF_FILE if no more files
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate device
@@ -1518,7 +1520,7 @@ PUB stats(device) : used_blocks, free_blocks, file_count | block_address
 '' @returns used_blocks, free_blocks, file_count
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED), 0, 0
 
   ' Acquire lock
@@ -1568,7 +1570,7 @@ PUB copy_file(p_src_filename, p_dest_filename) : status | src_handle, dest_handl
 '' @returns status - SUCCESS or error
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Allocate copy buffer from tmpBlockBuffer
@@ -1615,7 +1617,7 @@ PUB create_contiguous(p_filename, size_in_bytes) : status | device, p_name, bloc
 '' @returns status - SUCCESS, E_RAM_ONLY, E_CONTIGUOUS_FULL, E_BAD_FILE_LENGTH
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate size
@@ -1694,7 +1696,7 @@ PUB get_address(p_filename) : psram_address | device, p_name, signature, block_i
 '' @returns psram_address - raw PSRAM byte address, 0 if not contiguous/not found
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     LONG[@errorCode][cogid()] := E_NOT_MOUNTED
     return 0
 
@@ -1745,7 +1747,7 @@ PUB is_contiguous(p_filename) : isContiguous | device, p_name, signature, block_
 '' @returns isContiguous - true if contiguous RAM file
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return false
 
   ' Parse drive letter
@@ -1781,7 +1783,7 @@ PUB contiguous_size(p_filename) : size_in_bytes | device, p_name, signature, blo
 '' @returns size_in_bytes - size or 0 if not contiguous
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return 0
 
   ' Parse drive letter
@@ -1823,7 +1825,7 @@ PUB stream_read(psram_address, p_hub_buffer, byte_count) : status
 '' @returns status - SUCCESS or error
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate parameters
@@ -1848,7 +1850,7 @@ PUB stream_write(psram_address, p_hub_buffer, byte_count) : status
 '' @returns status - SUCCESS or error
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
 
   ' Validate parameters
@@ -1873,7 +1875,7 @@ PUB contiguous_status() : total_free, largest_free, fragment_count, compactable 
 '' @returns compactable - max achievable free region after compact (bytes)
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     LONG[@errorCode][cogid()] := E_NOT_MOUNTED
     return 0, 0, 0, 0
 
@@ -1952,7 +1954,7 @@ PUB compact() : bytes_reclaimed, largest_available | blk_addr, best_block, best_
 '' @returns largest_available - largest free region after operation
 
   ' Check if mounted
-  ifnot flashMounted and ramMounted
+  ifnot (flashMounted or ramMounted)
     LONG[@errorCode][cogid()] := E_NOT_MOUNTED
     return 0, 0
 
@@ -2971,7 +2973,7 @@ PRI exists_no_lock(device, p_name) : found
   return get_file_head_signature_device(device, p_name) <> 0
 
 
-PRI get_file_head_signature_device(device, p_name) : signature | name_crc, block_id, block_address, block_signature
+PRI get_file_head_signature_device(device, p_name) : signature | name_crc, block_id, block_address, header_sig, header_crc
 '' Find file and return head block signature
 '' @param device - DRIVE_F or DRIVE_R
 '' @param p_name - filename to find (without drive prefix)
@@ -2985,28 +2987,28 @@ PRI get_file_head_signature_device(device, p_name) : signature | name_crc, block
       if field[FlashIDValid][block_id]
         if field[FlashBlockState][field[FlashIDToBlock][block_id]] == B_HEAD
           block_address := field[FlashIDToBlock][block_id]
-          flash_read_block(block_address, @block_signature, $000, $007)
-          if LONG[@block_signature + 4].[31..12] == name_crc
+          ' Read signature and CRC separately to avoid buffer overflow
+          flash_read_block(block_address, @header_sig, $000, $003)
+          flash_read_block(block_address, @header_crc, $004, $007)
+          if header_crc.[31..12] == name_crc
             ' Verify filename matches (CRC collision check)
             flash_read_block(block_address, @tmpBlockBuffer, $008, $087)
             if strcomp(@tmpBlockBuffer, p_name)
-              ' Read full signature
-              flash_read_block(block_address, @signature, $000, $003)
-              return signature
+              return header_sig
   else
     ' Search RAM blocks for matching filename CRC
     repeat RAM_BLOCKS with block_id
       if field[RAMIDValid][block_id]
         if field[RAMBlockState][field[RAMIDToBlock][block_id]] == B_HEAD
           block_address := field[RAMIDToBlock][block_id]
-          ram_read_block(block_address, @block_signature, $000, $007)
-          if LONG[@block_signature + 4].[31..12] == name_crc
+          ' Read signature and CRC separately to avoid buffer overflow
+          ram_read_block(block_address, @header_sig, $000, $003)
+          ram_read_block(block_address, @header_crc, $004, $007)
+          if header_crc.[31..12] == name_crc
             ' Verify filename matches (CRC collision check)
             ram_read_block(block_address, @tmpBlockBuffer, $008, $087)
             if strcomp(@tmpBlockBuffer, p_name)
-              ' Read full signature
-              ram_read_block(block_address, @signature, $000, $003)
-              return signature
+              return header_sig
 
 
 PRI delete_chain_from_id(device, block_id, keep_head) | block_address, signature, next_id

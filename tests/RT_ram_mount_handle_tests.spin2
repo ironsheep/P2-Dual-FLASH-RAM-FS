@@ -1,0 +1,465 @@
+'' =================================================================================================
+''
+''   File....... RT_ram_mount_handle_tests.spin2
+''   Purpose.... Exercise mount, format, unmount, and handle operations on R: (RAM/PSRAM) drive
+''   Author..... Stephen M Moraco
+''               -- see below for terms of use
+''   E-mail.....stephen@ironsheep.biz
+''   Started.... JAN 2026
+''   Updated.... 09 JAN 2026
+''
+'' =================================================================================================
+
+CON
+
+     _CLKFREQ        = 300_000_000
+
+     ' RAM drive has 8,192 blocks of 4KB each
+     RAM_TOTAL_BLOCKS = 8192
+
+OBJ
+    fs    : "flash_ram_fs"
+    utils : "RT_utilities"
+
+DAT
+
+testfile1       BYTE    "R:miscTest.bin", 0
+testfile2       BYTE    "R:otherTest.bin", 0
+testfile3       BYTE    "R:yetAnotherTest.bin", 0
+testfile4       BYTE    "R:fourthTest.bin", 0
+testfile5       BYTE    "R:fifthTest.bin", 0
+
+usedBlocks      LONG    0
+freeBlocks      LONG    0
+fileCount       LONG    0
+handle          LONG    0
+handle1         LONG    0
+handle2         LONG    0
+handle3         LONG    0
+badHandle       LONG    0
+status          LONG    0
+desiredId       LONG    0
+fileSize        LONG    0
+rdCount         LONG    0
+rdValue         LONG    0
+snHi            LONG    0
+snLo            LONG    0
+endPosition     LONG    0
+writeLength     LONG    0
+filename        BYTE    0[127+1]
+
+PUB go()
+
+    debug("===========================================")
+    debug("RT_ram_mount_handle_tests - RAM Drive Tests")
+    debug("===========================================")
+    debug(" ")
+
+    ' ============================================================
+    ' TEST GROUP: Operations while filesystem NOT mounted
+    ' ============================================================
+    utils.startTestGroup(@"Attempting things while not mounted")
+
+    utils.startTest(@"unmount() when not mounted")
+    status := fs.unmount()
+    utils.evaluateResultNegError(status, fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"serial_number() when not mounted")
+    utils.setCheckCountPerTest(2)
+    snHi, snLo := fs.serial_number()
+    utils.evaluateSubValue(snHi, @"serial_number() hi", 0)
+    utils.evaluateSubValue(snLo, @"serial_number() lo", 0)
+
+    utils.startTest(@"open() when not mounted")
+    status := fs.open(@testfile1, "r")
+    utils.evaluateResultNegError(status, fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"rename() when not mounted")
+    status := fs.rename(@testfile1, @testfile2)
+    utils.evaluateResultNegError(status, fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"delete() when not mounted")
+    status := fs.delete(@testfile1)
+    utils.evaluateResultNegError(status, fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"exists() when not mounted")
+    utils.setCheckCountPerTest(2)
+    status := fs.exists(@testfile1)
+    utils.evaluateSubValue(status, @"exists()", false)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"exists()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"file_size() when not mounted")
+    status := fs.file_size(@testfile1)
+    utils.evaluateResultNegError(status, fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"stats() when not mounted")
+    utils.setCheckCountPerTest(2)
+    usedBlocks, freeBlocks, fileCount := fs.stats(fs.DRIVE_R)
+    utils.evaluateSubStatus(usedBlocks, @"stats()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"stats()", fs.E_NOT_MOUNTED)
+
+    badHandle := $1234  ' ignored when filesystem not mounted
+
+    utils.startTest(@"flush() when not mounted")
+    utils.setCheckCountPerTest(2)
+    status := fs.flush(badHandle)
+    utils.evaluateSubStatus(status, @"flush()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"flush()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"close() when not mounted")
+    utils.setCheckCountPerTest(2)
+    status := fs.close(badHandle)
+    utils.evaluateSubStatus(status, @"close()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"close()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"seek() when not mounted")
+    utils.setCheckCountPerTest(2)
+    endPosition := fs.seek(badHandle, 25, fs.SK_FILE_START)
+    utils.evaluateSubStatus(endPosition, @"seek()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"seek()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"wr_byte() when not mounted")
+    utils.setCheckCountPerTest(2)
+    status := fs.wr_byte(badHandle, 4)
+    utils.evaluateSubStatus(status, @"wr_byte()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"wr_byte()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"wr_word() when not mounted")
+    utils.setCheckCountPerTest(2)
+    status := fs.wr_word(badHandle, $fc0)
+    utils.evaluateSubStatus(status, @"wr_word()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"wr_word()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"wr_long() when not mounted")
+    utils.setCheckCountPerTest(2)
+    status := fs.wr_long(badHandle, $ffff_ece0)
+    utils.evaluateSubStatus(status, @"wr_long()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"wr_long()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"wr_str() when not mounted")
+    utils.setCheckCountPerTest(2)
+    status := fs.wr_str(badHandle, @"dummy string")
+    utils.evaluateSubStatus(status, @"wr_str()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"wr_str()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"rd_byte() when not mounted")
+    utils.setCheckCountPerTest(2)
+    rdValue := fs.rd_byte(badHandle)
+    utils.evaluateSubStatus(rdValue, @"rd_byte()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"rd_byte()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"rd_word() when not mounted")
+    utils.setCheckCountPerTest(2)
+    rdValue := fs.rd_word(badHandle)
+    utils.evaluateSubStatus(rdValue, @"rd_word()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"rd_word()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"rd_long() when not mounted")
+    utils.setCheckCountPerTest(2)
+    rdValue := fs.rd_long(badHandle)
+    ' rd_long returns error code as 32-bit value, check via error()
+    utils.evaluateSubStatus(rdValue, @"rd_long()", fs.E_NOT_MOUNTED)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"rd_long()", fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"rd_str() when not mounted")
+    utils.setCheckCountPerTest(2)
+    rdCount := fs.rd_str(badHandle, @filename, 127+1)
+    utils.evaluateSubValue(rdCount, @"rd_str()", 0)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"rd_str()", fs.E_NOT_MOUNTED)
+
+    ' ============================================================
+    ' TEST GROUP: Mount and format verification
+    ' ============================================================
+    utils.startTestGroup(@"Mount, format, and verify RAM drive")
+
+    utils.startTest(@"mount()")
+    status := fs.mount()
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    utils.showChipAndDriverVersion()
+
+    utils.startTest(@"format(DRIVE_R)")
+    status := fs.format(fs.DRIVE_R)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    ' Verify stats after format - should be empty filesystem
+    utils.startTest(@"stats() after format - verify empty")
+    utils.setCheckCountPerTest(3)
+    usedBlocks, freeBlocks, fileCount := fs.stats(fs.DRIVE_R)
+    utils.evaluateSubValue(usedBlocks, @"usedBlocks", 0)
+    utils.evaluateSubValue(freeBlocks, @"freeBlocks", RAM_TOTAL_BLOCKS)
+    utils.evaluateSubValue(fileCount, @"fileCount", 0)
+
+    utils.startTest(@"directory() should be empty after format")
+    desiredId := 0
+    fs.directory(fs.DRIVE_R, @desiredId, @filename, @fileSize)
+    rdCount := strsize(@filename)
+    utils.evaluateSubValue(rdCount, @"directory()", 0)
+
+    utils.ShowStats(fs.DRIVE_R)
+    utils.showFiles(fs.DRIVE_R)
+
+    ' ============================================================
+    ' TEST GROUP: Handle exhaustion (MAX_FILES_OPEN = 4)
+    ' ============================================================
+    utils.startTestGroup(@"Handle allocation and exhaustion (4 handles)")
+
+    utils.startTest(@"open() first file OK")
+    utils.setCheckCountPerTest(2)
+    handle := fs.open(@testfile1, "w")
+    status := fs.error()
+    utils.evaluateSubValue(handle, @"open()", 0)
+    utils.evaluateSubStatus(status, @"open()", fs.SUCCESS)
+
+    utils.startTest(@"open() second file OK")
+    utils.setCheckCountPerTest(2)
+    handle1 := fs.open(@testfile2, "w")
+    status := fs.error()
+    utils.evaluateSubValue(handle1, @"open()", 1)
+    utils.evaluateSubStatus(status, @"open()", fs.SUCCESS)
+
+    utils.startTest(@"open() third file OK")
+    utils.setCheckCountPerTest(2)
+    handle2 := fs.open(@testfile3, "w")
+    status := fs.error()
+    utils.evaluateSubValue(handle2, @"open()", 2)
+    utils.evaluateSubStatus(status, @"open()", fs.SUCCESS)
+
+    utils.startTest(@"open() fourth file OK")
+    utils.setCheckCountPerTest(2)
+    handle3 := fs.open(@testfile4, "w")
+    status := fs.error()
+    utils.evaluateSubValue(handle3, @"open()", 3)
+    utils.evaluateSubStatus(status, @"open()", fs.SUCCESS)
+
+    ' With all 4 handles used, fifth open should fail
+    utils.startTest(@"open() fifth file - no handles")
+    utils.setCheckCountPerTest(2)
+    status := fs.open(@testfile5, "w")
+    utils.evaluateSubStatus(status, @"open()", fs.E_NO_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"open()", fs.E_NO_HANDLE)
+
+    utils.startTest(@"close() first file without writing")
+    status := fs.close(handle)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    utils.startTest(@"close() second file without writing")
+    status := fs.close(handle1)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    utils.startTest(@"close() third file without writing")
+    status := fs.close(handle2)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    utils.startTest(@"close() fourth file without writing")
+    status := fs.close(handle3)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    ' Note: Opening files for "w" creates empty file headers even without writing
+    ' Format to clean up before next test group
+    utils.startTest(@"format() to clean up after handle tests")
+    status := fs.format(fs.DRIVE_R)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    utils.startTest(@"stats() after cleanup format")
+    utils.setCheckCountPerTest(3)
+    usedBlocks, freeBlocks, fileCount := fs.stats(fs.DRIVE_R)
+    utils.evaluateSubValue(usedBlocks, @"usedBlocks", 0)
+    utils.evaluateSubValue(freeBlocks, @"freeBlocks", RAM_TOTAL_BLOCKS)
+    utils.evaluateSubValue(fileCount, @"fileCount", 0)
+
+    ' ============================================================
+    ' TEST GROUP: Bad handle operations
+    ' ============================================================
+    utils.startTestGroup(@"Operations with bad handle $1234")
+    badHandle := $1234
+
+    utils.startTest(@"flush() with bad handle")
+    utils.setCheckCountPerTest(2)
+    status := fs.flush(badHandle)
+    utils.evaluateSubStatus(status, @"flush()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"flush()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"close() with bad handle")
+    utils.setCheckCountPerTest(2)
+    status := fs.close(badHandle)
+    utils.evaluateSubStatus(status, @"close()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"close()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"seek() with bad handle")
+    utils.setCheckCountPerTest(2)
+    endPosition := fs.seek(badHandle, 25, fs.SK_FILE_START)
+    utils.evaluateSubStatus(endPosition, @"seek()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"seek()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"wr_byte() with bad handle")
+    utils.setCheckCountPerTest(2)
+    status := fs.wr_byte(badHandle, 4)
+    utils.evaluateSubStatus(status, @"wr_byte()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"wr_byte()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"wr_word() with bad handle")
+    utils.setCheckCountPerTest(2)
+    status := fs.wr_word(badHandle, $fc0)
+    utils.evaluateSubStatus(status, @"wr_word()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"wr_word()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"wr_long() with bad handle")
+    utils.setCheckCountPerTest(2)
+    status := fs.wr_long(badHandle, $ffff_ece0)
+    utils.evaluateSubStatus(status, @"wr_long()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"wr_long()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"wr_str() with bad handle")
+    utils.setCheckCountPerTest(2)
+    status := fs.wr_str(badHandle, @"dummy string")
+    utils.evaluateSubStatus(status, @"wr_str()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"wr_str()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"rd_byte() with bad handle")
+    utils.setCheckCountPerTest(2)
+    rdValue := fs.rd_byte(badHandle)
+    utils.evaluateSubStatus(rdValue, @"rd_byte()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"rd_byte()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"rd_word() with bad handle")
+    utils.setCheckCountPerTest(2)
+    rdValue := fs.rd_word(badHandle)
+    utils.evaluateSubStatus(rdValue, @"rd_word()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"rd_word()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"rd_long() with bad handle")
+    utils.setCheckCountPerTest(2)
+    rdValue := fs.rd_long(badHandle)
+    ' rd_long returns error code as 32-bit value, check via error()
+    utils.evaluateSubStatus(rdValue, @"rd_long()", fs.E_BAD_HANDLE)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"rd_long()", fs.E_BAD_HANDLE)
+
+    utils.startTest(@"rd_str() with bad handle")
+    utils.setCheckCountPerTest(2)
+    rdCount := fs.rd_str(badHandle, @filename, 127+1)
+    utils.evaluateSubValue(rdCount, @"rd_str()", 0)
+    status := fs.error()
+    utils.evaluateSubStatus(status, @"rd_str()", fs.E_BAD_HANDLE)
+
+    ' ============================================================
+    ' TEST GROUP: File operations
+    ' ============================================================
+    utils.startTestGroup(@"Basic file operations")
+
+    utils.startTest(@"Create and write to file")
+    handle := fs.open(@testfile1, "w")
+    if handle >= 0
+        fs.wr_str(handle, @"Test data for file 1")
+        status := fs.close(handle)
+        utils.evaluateResultNegError(status, fs.SUCCESS)
+    else
+        utils.showError(@"open(w)", handle)
+        utils.registerFail()
+
+    utils.startTest(@"exists() - file should exist")
+    status := fs.exists(@testfile1)
+    utils.evaluateSingleValue(status, @"exists()", true)
+
+    utils.startTest(@"file_size() - check file size")
+    status := fs.file_size(@testfile1)
+    utils.evaluateSingleValue(status, @"file_size()", 21)  ' "Test data for file 1" + null = 21 bytes
+
+    utils.startTest(@"rename() file")
+    status := fs.rename(@testfile1, @testfile2)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    utils.startTest(@"exists() - old name should not exist")
+    status := fs.exists(@testfile1)
+    utils.evaluateSingleValue(status, @"exists()", false)
+
+    utils.startTest(@"exists() - new name should exist")
+    status := fs.exists(@testfile2)
+    utils.evaluateSingleValue(status, @"exists()", true)
+
+    utils.startTest(@"delete() file")
+    status := fs.delete(@testfile2)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    utils.startTest(@"exists() - deleted file should not exist")
+    status := fs.exists(@testfile2)
+    utils.evaluateSingleValue(status, @"exists()", false)
+
+    ' Verify filesystem is empty again
+    utils.startTest(@"stats() after delete - verify empty")
+    utils.setCheckCountPerTest(3)
+    usedBlocks, freeBlocks, fileCount := fs.stats(fs.DRIVE_R)
+    utils.evaluateSubValue(usedBlocks, @"usedBlocks", 0)
+    utils.evaluateSubValue(freeBlocks, @"freeBlocks", RAM_TOTAL_BLOCKS)
+    utils.evaluateSubValue(fileCount, @"fileCount", 0)
+
+    ' ============================================================
+    ' Cleanup
+    ' ============================================================
+    utils.ShowStats(fs.DRIVE_R)
+    utils.showFiles(fs.DRIVE_R)
+
+    status := fs.unmount()
+
+    ' Show final results
+    debug(" ")
+    debug("===========================================")
+    utils.ShowTestEndCounts()
+    debug("===========================================")
+    debug(" ")
+    debug("END_SESSION")
+    repeat
+
+
+con { license }
+
+{{
+  =================================================================================================
+
+  Terms of Use: MIT License
+
+  Copyright (c) 2026 Iron Sheep Productions, LLC
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify,
+  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following
+  conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies
+  or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+  OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  =================================================================================================
+}}
