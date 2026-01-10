@@ -276,7 +276,10 @@ pub ShowStats(device) | blocksUsed, blocksFree, fileCount
 
 pub showFiles(device) | blockID, byteCount, byte Buff[30], BlocksUsed
     debug(" ")  ' blank line
-    debug("  All Files on ", device == fs.DRIVE_F ? @"F:" : @"R:", ":")
+    if device == fs.DRIVE_F
+        debug("  All Files on F:")
+    else
+        debug("  All Files on R:")
     blockID := 0
     repeat
         fs.directory(device, @blockID, @filename, @byteCount)
