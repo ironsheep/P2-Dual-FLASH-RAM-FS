@@ -217,3 +217,4 @@ CLAUDE.md
 *.obj
 *.lst
 *.map
+pnut-term-settings.json
