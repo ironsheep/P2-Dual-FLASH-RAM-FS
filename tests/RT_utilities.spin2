@@ -1,0 +1,457 @@
+'' =================================================================================================
+''
+''   File....... RT_utilities.spin2
+''   Purpose.... This object provides commonly used regression test parts to each test object
+''               (Adapted for dual filesystem - flash_ram_fs)
+''   Author..... Stephen M Moraco
+''               -- see below for terms of use
+''   E-mail.....stephen@ironsheep.biz
+''   Started.... JAN 2026
+''   Updated.... 09 JAN 2026
+''
+'' =================================================================================================
+
+CON
+
+  TEST_SIGNATURE = $12345678
+
+OBJ
+    fs : "flash_ram_fs"
+
+
+VAR { test stats vars }
+
+  LONG    numberTests[8]
+  LONG    subTestPer[8]
+  LONG    passCount[8]
+  LONG    failCount[8]
+  LONG    passCountSub[8]
+  LONG    failCountSub[8]
+
+  LONG    varSignature[8]
+
+  BYTE    versionString[14]  '  "flash_ram_fs v"
+  BYTE    vDigits[5+1]       ' "x.x.x", 0
+
+  byte    filename[128]
+
+pub null()
+
+'' This is not an application
+''  (invoke format() or mount() to use the flash file system)
+
+pri initIfNotAlready()
+    if varSignature[cogId()] <> TEST_SIGNATURE
+        numberTests[cogId()] := 0
+        subTestPer[cogId()] := 1
+        passCount[cogId()] := 0
+        failCount[cogId()] := 0
+        passCountSub[cogId()] := 0
+        failCountSub[cogId()] := 0
+        strcopy(@versionString, @"flash_ram_fs vx.x.x",19)
+        varSignature[cogId()] := TEST_SIGNATURE
+        debug("* init VAR")
+
+pub showChipAndDriverVersion() | snHi, snLo, version, hundreds, tens, units
+    debug(" ")
+    debug("* Environment: Chip S/N and Driver Version")
+    snHi, snLo := fs.serial_number()
+    debug("   CHIP Serial Number: ", uhex_long_(snHi), "-", uhex_long_(snLo))
+    version := fs.version()
+
+   ' brute force... (someone didn't import a string formatter, I wonder who that was?)
+    hundreds := version / 100
+    BYTE[@vDigits][0] := "0" + hundreds
+    tens := (version - (hundreds * 100)) / 10
+    BYTE[@vDigits][2] := "0" + tens
+    units := version - (hundreds * 100) - (tens * 10)
+    BYTE[@vDigits][4] := "0" + units
+    debug ("   Driver: ", zstr_(@versionString))
+
+
+pub startTestGroup(pDesciption)
+    ' show test-group heading
+
+    initIfNotAlready()
+    showSubTestResults()
+
+    debug(" ")  ' blank line
+    debug(" ")  ' blank line
+    debug(" ------------------------------------------------------------")  ' blank line
+    debug("* Test Group: ", zstr_(pDesciption))
+
+pub startTest(pDesciption) | ecGot, ecExpected, passScaled, failScaled, total
+    ' if prior sub tests show sub tests results
+
+    initIfNotAlready()
+    showSubTestResults()
+
+    numberTests[cogId()]++
+    '  now show new test info
+    debug(" ")  ' blank line
+    debug("* Test #", udec_(numberTests[cogId()]), ": ", zstr_(pDesciption))
+
+
+pub showSubTestResults() | passScaled, failScaled, total, pPassFail
+    if failCountSub[cogId()] <> 0 or passCountSub[cogId()] <> 0
+        total := (passCountSub[cogId()] + failCountSub[cogId()]) / subTestPer[cogId()]
+        passScaled := passCountSub[cogId()] / subTestPer[cogId()]
+        failScaled := total - passScaled ' >= 0 ? total - passScaled : 0
+        debug("  Sub-Test Results: count=", udec_(total), ", Pass: ", udec_(passScaled), ", Fail: ", udec_(failScaled))
+        if failScaled < 0
+          debug("  Sub-Test (", udec(passCountSub[cogId()], failCountSub[cogId()]), ")")
+
+        if failCountSub[cogId()] <> 0
+            failCount[cogId()]++
+        else
+            passCount[cogId()]++
+        pPassFail := failCountSub[cogId()] <> 0 ? @"FAIL" : @"pass"
+        debug("   -> ", zstr_(pPassFail))
+        passCountSub[cogId()] := 0
+        failCountSub[cogId()] := 0
+
+
+pub ShowTestEndCounts() | pMsg
+    ' show summary of all tests
+    showSubTestResults()  ' ensure last subtest results are shown
+    debug(" ")  ' blank line
+    debug("* ", udec_(numberTests[cogId()]), " Tests - Pass: ", udec_(passCount[cogId()]), ", Fail: ", udec_(failCount[cogId()]))
+    if numberTests[cogId()] <> passCount[cogId()] + failCount[cogId()]
+      pMsg := (numberTests[cogId()] > passCount[cogId()] + failCount[cogId()]) ? @"missing" : @"extra"
+      debug("*  BAD TEST COUNTS: ", udec_(numberTests[cogId()]), " <> ", udec_(passCount[cogId()] + failCount[cogId()]), " (", zstr_(pMsg), " ", udec_(abs(numberTests[cogId()] - (passCount[cogId()] + failCount[cogId()]))), " tests)")
+
+
+pub ShowMultiCogTestEndCounts() | pMsg, totalTests, totalPasses, totalFails, cogIdx
+    ' show summary of all tests
+    ' gather totals
+    repeat 8 with cogIdx
+      totalTests += numberTests[cogIdx]
+      totalPasses += passCount[cogIdx]
+      totalFails += failCount[cogIdx]
+  ' report totals
+    debug(" ")  ' blank line
+    debug("* TOTALs ", udec_(totalTests), " Tests - Pass: ", udec_(totalPasses), ", Fail: ", udec_(totalFails))
+    if totalTests <> totalPasses + totalFails
+      pMsg := (totalTests > totalPasses + totalFails) ? @"missing" : @"extra"
+      debug("*  TOTALs BAD TEST COUNTS: ", udec_(totalTests), " <> ", udec_(totalPasses + totalFails), " (", zstr_(pMsg), " ", udec_(abs(totalTests - (totalPasses + totalFails))), " tests)")
+
+
+pub registerFail()
+    '' Register a test failure (for early exit cases)
+    failCount[cogId()]++
+    debug("   -> FAIL")
+
+
+pub setCheckCountPerTest(countTests)
+
+'' set the number of subtests per record/group
+''
+'' @param countTests - the number of checks per item tested
+
+  subTestPer[cogId()] := countTests
+
+pub evaluateSubStatus(result, pMessage, expectedResult) | ecGot, ecExpected, bPassed, pPassFail
+    ecGot := fs.string_for_error(result)
+    ecExpected := fs.string_for_error(expectedResult)
+    bPassed := result == expectedResult
+    pPassFail := !bPassed ? @"Sub-FAIL" : @"pass"
+    ifnot bPassed
+        failCountSub[cogId()]++
+    else
+        passCountSub[cogId()]++
+    ifnot bPassed               ' only show result on failure
+        ifnot bPassed
+            debug("  Status: ", zstr_(ecGot), "(", sdec_(result), "),  (expected ", zstr_(ecExpected), "(", sdec_(expectedResult), "))")
+        else
+            debug("  Status: ", zstr_(ecGot), "(", sdec_(result), ")")
+        debug("   -> ", zstr_(pPassFail))
+
+pub evaluateSubValue(result, pMessage, expectedResult) | bPassed, pPassFail
+    bPassed := result == expectedResult
+    pPassFail := !bPassed ? @"Sub-FAIL" : @"pass"
+    ifnot bPassed
+        failCountSub[cogId()]++
+    else
+        passCountSub[cogId()]++
+    ifnot bPassed               ' only show result on failure
+        debug("  Sub-Test: ", zstr_(pMessage))
+        ifnot bPassed
+            debug("  Value: ", uhex_long_(result), " (expected ", uhex_long_(expectedResult), ")")
+        else
+            debug("  Value: ", uhex_long_(result))
+        debug("   -> ", zstr_(pPassFail))
+
+
+pub evaluateResultNegError(result, expectedResult) | ecGot, ecExpected, bPassed, pPassFail
+    bPassed := result == expectedResult
+    pPassFail := !bPassed ? @"FAIL" : @"pass"
+    if result > 0
+        ifnot bPassed
+            if expectedResult < 0
+                ecExpected := fs.string_for_error(expectedResult)
+                debug("  Result: ", sdec_(result), " (expected ", zstr_(ecExpected), ")")
+            else
+                debug("  Result: ", udec_(result), " (expected ", udec_(expectedResult), ")")
+            failCount[cogId()]++
+        else
+            debug("  Result: ", udec_(result))
+            passCount[cogId()]++
+    else
+        ecGot := fs.string_for_error(result)
+        ecExpected := fs.string_for_error(expectedResult)
+        ifnot bPassed
+            debug("   ECode: ", zstr_(ecGot), " (expected ", zstr_(ecExpected), ")")
+            failCount[cogId()]++
+        else
+            debug("   ECode: ", zstr_(ecGot))
+            passCount[cogId()]++
+    debug("   -> ", zstr_(pPassFail))
+
+
+pub evaluateSingleValue(result, pMessage, expectedResult) | bPassed, pPassFail
+    bPassed := result == expectedResult
+    pPassFail := !bPassed ? @"FAIL" : @"pass"
+    ifnot bPassed
+        debug("  ", zstr_(pMessage), ": ", sdec_long_(result), " (expected ", sdec_long_(expectedResult), ")")
+        failCount[cogId()]++
+    else
+        debug("  ", zstr_(pMessage), ": ", sdec_long_(result))
+        passCount[cogId()]++
+    debug("   -> ", zstr_(pPassFail))
+
+
+pub evaluateHandle(resultHandle, pMessage) | bPassed, pPassFail
+    bPassed := resultHandle >= 0
+    pPassFail := !bPassed ? @"FAIL" : @"pass"
+    ifnot bPassed
+        debug("  ", zstr_(pMessage), ": ", sdec_long_(resultHandle), " (expected >= 0)")
+        failCount[cogId()]++
+    else
+        debug("  ", zstr_(pMessage), ": ", sdec_long_(resultHandle))
+        passCount[cogId()]++
+    debug("   -> ", zstr_(pPassFail))
+
+
+pub evaluateFSStats(pMessage, expectedFileCount, expectedBlocksUsed, device) | blocksUsed, blocksFree, fileCount, bPassed, pPassFail
+
+'' Report on expected vs. actual filesystem stats for a specific drive
+''
+'' @param pMessage - intro message
+'' @param expectedFileCount - count of files expected
+'' @param expectedBlocksUsed - count of blocks used expected
+'' @param device - DRIVE_F or DRIVE_R
+
+' Local Variables:
+' @local blocksUsed -
+' @local blocksFree -
+' @local fileCount -
+    debug("* ", zstr_(pMessage))
+    blocksUsed, blocksFree, fileCount := fs.stats(device)
+    debug("  # FileSystem: ", udec_(blocksUsed, blocksFree, fileCount))
+    bPassed := expectedFileCount == fileCount and expectedBlocksUsed == blocksUsed
+    if fileCount <> expectedFileCount
+        debug("  # files: ", udec_(fileCount), " (expected ", udec_(expectedFileCount), ")")
+    else
+        debug("  # files: ", udec_(fileCount))
+    if blocksUsed <> expectedBlocksUsed
+        debug("  # blocks used: ", udec_(blocksUsed), " (expected ", udec_(expectedBlocksUsed), ")")
+    else
+        debug("  # blocks used: ", udec_(blocksUsed))
+    pPassFail := !bPassed ? @"FAIL" : @"pass"
+    ifnot bPassed
+        failCount[cogId()]++
+    else
+        passCount[cogId()]++
+    debug("   -> ", zstr_(pPassFail))
+
+
+pub showError(pCaller, errorCode)
+    debug("EEEE ", zstr_(pCaller), " error: ", zstr_(fs.string_for_error(errorCode)))
+
+pub ShowStats(device) | blocksUsed, blocksFree, fileCount
+
+    blocksUsed, blocksFree, fileCount := fs.stats(device)
+    debug(udec(blocksUsed, blocksFree, fileCount))
+
+
+pub showFiles(device) | blockID, byteCount, byte Buff[30], BlocksUsed
+    debug(" ")  ' blank line
+    debug("  All Files on ", device == fs.DRIVE_F ? @"F:" : @"R:", ":")
+    blockID := 0
+    repeat
+        fs.directory(device, @blockID, @filename, @byteCount)
+        BlocksUsed := blockCountForFileSize(byteCount, device)
+        if filename[0]
+            debug(zstr_(@filename), udec(byteCount, blockID, BlocksUsed))
+        else
+            quit
+
+pub ensureEmptyDirectory(device) | blockID, byteCount, bPassed, pPassFail
+'' validate that directory is empty!
+    fs.directory(device, @blockID, @filename, @byteCount)
+    bPassed := true
+    if filename[0]
+        bPassed := false
+    pPassFail := !bPassed ? @"FAIL" : @"pass"
+
+    ifnot bPassed
+        debug("  # Error Found file: [", zstr_(@filename), "] (expected: no files)")
+        failCount[cogId()]++
+    else
+        passCount[cogId()]++
+    debug("   -> ", zstr_(pPassFail))
+
+
+pub blockCountForFileSize(fileSizeInBytes, device) : blockCount | remainingSize, overflowBodyCount, bytesInHead, bytesInBody
+    ' return number of blocks for given file size
+    if device == fs.DRIVE_F
+        bytesInHead := fs.FLASH_BYTES_IN_HEAD_BLOCK
+        bytesInBody := fs.FLASH_BYTES_IN_BODY_BLOCK
+    else
+        bytesInHead := fs.RAM_BYTES_IN_HEAD_BLOCK
+        bytesInBody := fs.RAM_BYTES_IN_BODY_BLOCK
+
+    blockCount := 1 ' head block
+    if fileSizeInBytes > bytesInHead
+        remainingSize := fileSizeInBytes - bytesInHead
+        blockCount += remainingSize / bytesInBody
+        overflowBodyCount := remainingSize +// bytesInBody
+        if overflowBodyCount > 0
+            blockCount++
+
+pub bytesAllocatedFor(sizeInBytes, device) : maxAllocationBytes | bodyBlocks, bytesInHead, bytesInBody
+    ' return max allocation size for circular file
+    if device == fs.DRIVE_F
+        bytesInHead := fs.FLASH_BYTES_IN_HEAD_BLOCK
+        bytesInBody := fs.FLASH_BYTES_IN_BODY_BLOCK
+    else
+        bytesInHead := fs.RAM_BYTES_IN_HEAD_BLOCK
+        bytesInBody := fs.RAM_BYTES_IN_BODY_BLOCK
+
+    maxAllocationBytes := bytesInHead
+    if sizeInBytes > bytesInHead
+        bodyBlocks := ((sizeInBytes - bytesInHead) + (bytesInBody - 1)) / bytesInBody
+        maxAllocationBytes += bodyBlocks * bytesInBody
+
+
+pub bytesAllocatedInBlocks(numberBlocks, device) : sizeInBytes | bytesInHead, bytesInBody
+  ' return max number of bytes stored in given amount of blocks
+    if device == fs.DRIVE_F
+        bytesInHead := fs.FLASH_BYTES_IN_HEAD_BLOCK
+        bytesInBody := fs.FLASH_BYTES_IN_BODY_BLOCK
+    else
+        bytesInHead := fs.RAM_BYTES_IN_HEAD_BLOCK
+        bytesInBody := fs.RAM_BYTES_IN_BODY_BLOCK
+
+  sizeInBytes := bytesInHead
+  if numberBlocks > 1
+    sizeInBytes += (numberBlocks - 1) * bytesInBody
+
+pub bytesInLastBlock(totalBytes, device) : bytesInLast | bytesInHead, bytesInBody
+    if device == fs.DRIVE_F
+        bytesInHead := fs.FLASH_BYTES_IN_HEAD_BLOCK
+        bytesInBody := fs.FLASH_BYTES_IN_BODY_BLOCK
+    else
+        bytesInHead := fs.RAM_BYTES_IN_HEAD_BLOCK
+        bytesInBody := fs.RAM_BYTES_IN_BODY_BLOCK
+
+  bytesInLast := totalBytes
+  if totalBytes > bytesInHead
+     bytesInLast -= bytesInHead
+  if bytesInLast > bytesInBody
+    bytesInLast := bytesInLast +// bytesInBody
+
+
+' -------
+' dbgMemDump(@"TASK Stack", pStack, (nStackLongCt + 1) * 4)
+
+pub dbgMemDumpAbs(pMessage, pBytes, lenBytes) | rowCount, rowLen, pCurrByte, lastRowByteCount, bytesSoFar
+'' Dump rows of hex values with address preceeding
+    if pMessage
+        debug("** ", zstr_(pMessage), ":")
+
+    rowCount := lenBytes / 16
+    lastRowByteCount := lenBytes - (rowCount * 16)
+    pCurrByte := pBytes
+    bytesSoFar := 0
+
+    ' emit full lines
+    if rowCount > 0
+        repeat rowCount
+            dbgMemDumpRowAbs(pCurrByte, 16)
+            pCurrByte += 16
+            bytesSoFar += 16
+
+    if  bytesSoFar < lenBytes
+        ' emit last line
+        dbgMemDumpRowAbs(pCurrByte, lastRowByteCount)
+
+pri dbgMemDumpRowAbs(pBytes, lenBytes)
+' emit address followed by bytes
+    debug(" ", uhex_long_(pBytes), ": ", uhex_byte_array_(pBytes, lenBytes))
+
+
+pub dbgMemDump(pMessage, pBytes, lenBytes) | rowCount, rowLen, pCurrByte, lastRowByteCount, bytesSoFar, offset
+
+    if pMessage
+        debug("** ", zstr_(pMessage), ":")
+
+    offset := 0
+    rowCount := lenBytes / 16
+    lastRowByteCount := lenBytes - (rowCount * 16)
+    pCurrByte := pBytes
+    bytesSoFar := 0
+
+    ' emit full lines
+    if rowCount > 0
+        repeat rowCount
+            dbgMemDumpRow(pCurrByte, 16, offset)
+            offset += 16
+            pCurrByte += 16
+            bytesSoFar += 16
+
+    if  bytesSoFar < lenBytes
+        ' emit last line
+        dbgMemDumpRow(pCurrByte, lastRowByteCount, offset)
+
+pri dbgMemDumpRow(pBytes, lenBytes, offset)
+' emit address followed by bytes
+    debug(" ", uhex_long_(offset), ": ", uhex_byte_array_(pBytes, lenBytes))
+
+pub record_crc(p_record_buffer, record_length) : crc
+' Calculate and return the CRC for this pointed to block
+'
+' @param p_block_buffer - the address of the 4KB buffer for the file associated with this handle
+' @returns crc - the calculated CRC for the block
+
+  return getcrc(p_record_buffer, $AD0424F3 rev 31, record_length - 4)  'compute CRC of a buffered block
+
+
+con { license }
+
+{{
+  =================================================================================================
+
+  Terms of Use: MIT License
+
+  Copyright (c) 2026 Iron Sheep Productions, LLC
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify,
+  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following
+  conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies
+  or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+  OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  =================================================================================================
+}}

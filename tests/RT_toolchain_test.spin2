@@ -1,0 +1,29 @@
+'' =================================================================================================
+''   File: RT_toolchain_test.spin2
+''   Minimal test to verify compile/download/run toolchain works
+'' =================================================================================================
+
+CON
+    _clkfreq    = 300_000_000                            ' 300 MHz
+
+PUB main() | i
+
+    debug("===========================================")
+    debug("  Toolchain Verification Test")
+    debug("===========================================")
+    debug(" ")
+    debug("Clock frequency: ", udec(_clkfreq), " Hz")
+    debug(" ")
+
+    ' Simple loop to show we're running
+    repeat i from 1 to 5
+        debug("  Count: ", udec(i))
+        waitms(100)
+
+    debug(" ")
+    debug("Test completed successfully!")
+    debug(" ")
+    debug("END_OF_TEST")
+
+    ' Halt
+    repeat

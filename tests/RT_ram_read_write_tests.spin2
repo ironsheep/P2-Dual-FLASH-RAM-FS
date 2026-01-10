@@ -1,0 +1,369 @@
+'' =================================================================================================
+''
+''   File....... RT_ram_read_write_tests.spin2
+''   Purpose.... Exercise read/write functions on R: (RAM/PSRAM) drive
+''   Author..... Stephen M Moraco
+''               -- see below for terms of use
+''   E-mail.....stephen@ironsheep.biz
+''   Started.... JAN 2026
+''   Updated.... 09 JAN 2026
+''
+'' =================================================================================================
+
+CON
+
+     _CLKFREQ        = 300_000_000
+
+OBJ
+    fs    : "flash_ram_fs"
+    utils : "RT_utilities"
+
+DAT
+
+testfile1       BYTE    "R:rw10bytes.bin", 0
+testfile2       BYTE    "R:rw9words.bin", 0
+testfile3       BYTE    "R:rw12longs.bin", 0
+testfile4       BYTE    "R:rw10strings.zstr", 0
+testfile5       BYTE    "R:fullHeadLongs.bin", 0
+testfile6       BYTE    "R:moreThanHeadLongs.bin", 0
+testfile7       BYTE    "R:moreThanHeadBodyLongs.bin", 0
+
+handle          LONG    0
+testValue       LONG    0
+status          LONG    0
+
+PUB go() | snHi, snLo
+
+    debug("===========================================")
+    debug("RT_ram_read_write_tests - RAM Drive Tests")
+    debug("===========================================")
+    debug(" ")
+
+    ' Mount filesystem first
+    status := fs.mount()
+    if status < 0
+        utils.showError(@"mount()", status)
+        return
+
+    ' Format RAM drive for clean tests
+    status := fs.format(fs.DRIVE_R)
+    if status < 0
+        utils.showError(@"format(DRIVE_R)", status)
+        return
+
+    utils.ShowStats(fs.DRIVE_R)
+    utils.showFiles(fs.DRIVE_R)
+
+    utils.showChipAndDriverVersion()
+
+    utils.startTest(@"Ensure we have no files at start")
+    utils.ensureEmptyDirectory(fs.DRIVE_R)
+
+    ' ----------------------------------
+    ' TEST: Read when file doesn't exist
+    utils.startTest(@"BAD: Read when file doesn't exist")
+    handle := fs.open(@testfile1, "r")
+    utils.evaluateResultNegError(handle, fs.E_FILE_NOT_FOUND)
+
+    ' Real tests start here:
+    utils.startTestGroup(@"Head block only - partially filled with 5 BYTEs")
+    testWriteBytes(@testfile1, 5, 0, 0)
+    testVerifyBytes(@testfile1, 5)
+
+    utils.showFiles(fs.DRIVE_R)
+
+    utils.startTestGroup(@"Head block only (replace file) - partially filled with 10 BYTEs")
+    testWriteBytes(@testfile1, 10, 0, 0)
+    testVerifyBytes(@testfile1, 10)
+
+    utils.showFiles(fs.DRIVE_R)
+
+    utils.startTestGroup(@"Head block only - partially filled with 9 WORDs")
+    testWriteWords(@testfile2, 9, 1, 1)
+    testVerifyWords(@testfile2, 9)
+
+    utils.showFiles(fs.DRIVE_R)
+
+    utils.startTestGroup(@"Head block only - partially filled with 12 LONGs")
+    testWriteLongs(@testfile3, 12, 2, 2)
+    testVerifyLongs(@testfile3, 12, 2)
+
+    utils.showFiles(fs.DRIVE_R)
+
+    utils.startTestGroup(@"Head block only - partially filled with 10 STRINGs")
+    testWriteStrings(@testfile4, 10, 3, 3)
+
+    utils.showFiles(fs.DRIVE_R)
+
+    utils.startTestGroup(@"Head block only - filled with LONGs")
+    testWriteLongs(@testfile5, fs.RAM_LONGS_IN_HEAD_BLOCK, 4, 4)
+    testVerifyLongs(@testfile5, fs.RAM_LONGS_IN_HEAD_BLOCK, 4)
+
+    utils.startTestGroup(@"Head block + body block - filled with LONGs full head + 2")
+    testWriteLongs(@testfile6, fs.RAM_LONGS_IN_HEAD_BLOCK + 2, 5, 5)
+    testVerifyLongs(@testfile6, fs.RAM_LONGS_IN_HEAD_BLOCK + 2, 5)
+
+    utils.startTestGroup(@"Head + 2 body blocks - full head, full body, + 2 LONGs")
+    testWriteLongs(@testfile7, fs.RAM_LONGS_IN_HEAD_BLOCK + fs.RAM_LONGS_IN_BODY_BLOCK + 2, 6, 7)
+    testVerifyLongs(@testfile7, fs.RAM_LONGS_IN_HEAD_BLOCK + fs.RAM_LONGS_IN_BODY_BLOCK + 2, 6)
+
+    utils.startTestGroup(@"Various odd size reads for boundary testing")
+    testVerifyReads(@testfile7)
+
+    utils.showFiles(fs.DRIVE_R)
+
+    ' --- Mount testing: do files survive unmount()/mount()?
+    utils.startTestGroup(@"unmount(), mount() - ensure files survive")
+    utils.startTest(@"unmount()")
+    status := fs.unmount()
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    utils.startTest(@"serial_number() while FS not mounted")
+    utils.setCheckCountPerTest(2)
+    snHi, snLo := fs.serial_number()
+    utils.evaluateSubValue(snHi, @"serial_number() hi", 0)
+    utils.evaluateSubValue(snLo, @"serial_number() lo", 0)
+
+    utils.startTest(@"open() while FS not mounted")
+    status := fs.open(@testfile7, "r")
+    utils.evaluateResultNegError(status, fs.E_NOT_MOUNTED)
+
+    utils.startTest(@"mount() FS")
+    status := fs.mount()
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+    ' NOTE: RAM files do NOT persist across unmount/mount
+    ' The block tracking state is cleared on ram_init() - this is by design
+    ' RAM is volatile storage; use Flash for persistent files
+    utils.showFiles(fs.DRIVE_R)
+
+    ' Cleanup
+    status := fs.unmount()
+
+    ' Show final results
+    debug(" ")
+    debug("===========================================")
+    utils.ShowTestEndCounts()
+    debug("===========================================")
+    debug(" ")
+    debug("END_SESSION")
+    repeat
+
+
+PRI testWriteBytes(pFilename, count, startValue, expectedBlocks) | idx, writeValue
+    utils.startTest(@"Write BYTEs to file")
+    handle := fs.open(pFilename, "w")
+    if handle < 0
+        utils.showError(@"open(w)", handle)
+        return
+
+    repeat idx from 0 to count - 1
+        writeValue := (startValue + idx) & $FF
+        status := fs.wr_byte(handle, writeValue)
+        if status < 0
+            utils.showError(@"wr_byte()", status)
+            fs.close(handle)
+            return
+
+    status := fs.close(handle)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+
+PRI testVerifyBytes(pFilename, count) | idx, readValue, expectedValue
+    utils.startTest(@"Read/verify BYTEs from file")
+    utils.setCheckCountPerTest(count)
+
+    handle := fs.open(pFilename, "r")
+    if handle < 0
+        utils.showError(@"open(r)", handle)
+        return
+
+    repeat idx from 0 to count - 1
+        readValue := fs.rd_byte(handle)
+        expectedValue := idx & $FF
+        utils.evaluateSubValue(readValue, @"rd_byte()", expectedValue)
+
+    fs.close(handle)
+
+
+PRI testWriteWords(pFilename, count, startValue, expectedBlocks) | idx, writeValue
+    utils.startTest(@"Write WORDs to file")
+    handle := fs.open(pFilename, "w")
+    if handle < 0
+        utils.showError(@"open(w)", handle)
+        return
+
+    repeat idx from 0 to count - 1
+        writeValue := ((startValue + idx) * $101) & $FFFF
+        status := fs.wr_word(handle, writeValue)
+        if status < 0
+            utils.showError(@"wr_word()", status)
+            fs.close(handle)
+            return
+
+    status := fs.close(handle)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+
+PRI testVerifyWords(pFilename, count) | idx, readValue, expectedValue
+    utils.startTest(@"Read/verify WORDs from file")
+    utils.setCheckCountPerTest(count)
+
+    handle := fs.open(pFilename, "r")
+    if handle < 0
+        utils.showError(@"open(r)", handle)
+        return
+
+    repeat idx from 0 to count - 1
+        readValue := fs.rd_word(handle)
+        expectedValue := ((1 + idx) * $101) & $FFFF
+        utils.evaluateSubValue(readValue, @"rd_word()", expectedValue)
+
+    fs.close(handle)
+
+
+PRI testWriteLongs(pFilename, count, startValue, expectedBlocks) | idx, writeValue
+    utils.startTest(@"Write LONGs to file")
+    handle := fs.open(pFilename, "w")
+    if handle < 0
+        utils.showError(@"open(w)", handle)
+        return
+
+    repeat idx from 0 to count - 1
+        ' Use modular arithmetic to avoid overflow (keep each byte 0-255)
+        writeValue := ((startValue + idx) & $FF) * $01010101
+        status := fs.wr_long(handle, writeValue)
+        if status < 0
+            utils.showError(@"wr_long()", status)
+            fs.close(handle)
+            return
+
+    status := fs.close(handle)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+
+PRI testVerifyLongs(pFilename, count, startValue) | idx, readValue, expectedValue
+    utils.startTest(@"Read/verify LONGs from file")
+    utils.setCheckCountPerTest(count)
+
+    handle := fs.open(pFilename, "r")
+    if handle < 0
+        utils.showError(@"open(r)", handle)
+        utils.registerFail()  ' Register fail so test count matches
+        return
+
+    repeat idx from 0 to count - 1
+        readValue := fs.rd_long(handle)
+        ' Use modular arithmetic to match write (keep each byte 0-255)
+        expectedValue := ((startValue + idx) & $FF) * $01010101
+        utils.evaluateSubValue(readValue, @"rd_long()", expectedValue)
+
+    fs.close(handle)
+
+
+DAT
+  testStrings   BYTE  "String 0", 0
+                BYTE  "String 1", 0
+                BYTE  "String 2", 0
+                BYTE  "String 3", 0
+                BYTE  "String 4", 0
+                BYTE  "String 5", 0
+                BYTE  "String 6", 0
+                BYTE  "String 7", 0
+                BYTE  "String 8", 0
+                BYTE  "String 9", 0
+
+PRI testWriteStrings(pFilename, count, startValue, expectedBlocks) | idx, pString
+    utils.startTest(@"Write STRINGs to file")
+    handle := fs.open(pFilename, "w")
+    if handle < 0
+        utils.showError(@"open(w)", handle)
+        return
+
+    pString := @testStrings
+    repeat idx from 0 to 9
+        status := fs.wr_str(handle, pString)
+        if status < 0
+            utils.showError(@"wr_str()", status)
+            fs.close(handle)
+            return
+        pString += strsize(pString) + 1
+
+    status := fs.close(handle)
+    utils.evaluateResultNegError(status, fs.SUCCESS)
+
+
+PRI testVerifyReads(pFilename) | readCount, bytesRead
+    ' Test various read sizes to check boundary conditions
+    utils.startTest(@"Read various byte counts")
+    utils.setCheckCountPerTest(5)
+
+    handle := fs.open(pFilename, "r")
+    if handle < 0
+        utils.showError(@"open(r)", handle)
+        utils.registerFail()  ' Register fail so test count matches
+        return
+
+    ' Read 1 byte
+    bytesRead := fs.rd_byte(handle)
+    utils.evaluateSubValue(bytesRead >= 0 ? 1 : bytesRead, @"rd_byte(1)", 1)
+
+    ' Read 3 bytes (odd number)
+    readCount := 0
+    repeat 3
+        if fs.rd_byte(handle) >= 0
+            readCount++
+    utils.evaluateSubValue(readCount, @"rd_byte(3x)", 3)
+
+    ' Read 4 bytes (one long)
+    readCount := 0
+    repeat 4
+        if fs.rd_byte(handle) >= 0
+            readCount++
+    utils.evaluateSubValue(readCount, @"rd_byte(4x)", 4)
+
+    ' Read 7 bytes (odd, spans long boundary)
+    readCount := 0
+    repeat 7
+        if fs.rd_byte(handle) >= 0
+            readCount++
+    utils.evaluateSubValue(readCount, @"rd_byte(7x)", 7)
+
+    ' Read 16 bytes (4 longs)
+    readCount := 0
+    repeat 16
+        if fs.rd_byte(handle) >= 0
+            readCount++
+    utils.evaluateSubValue(readCount, @"rd_byte(16x)", 16)
+
+    fs.close(handle)
+
+
+con { license }
+
+{{
+  =================================================================================================
+
+  Terms of Use: MIT License
+
+  Copyright (c) 2026 Iron Sheep Productions, LLC
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify,
+  merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to the following
+  conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies
+  or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+  HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+  CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+  OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  =================================================================================================
+}}

@@ -1,0 +1,196 @@
+' RT_smoke_test.spin2 - Basic smoke test for flash_ram_fs
+'
+' Purpose: Validate that the most basic operations work before
+'          attempting comprehensive testing or benchmarking.
+'
+' Tests (in order):
+'   1. Mount file system
+'   2. Format R: (RAM) drive
+'   3. Write single byte to R:
+'   4. Read it back - verify match
+'   5. Format F: (Flash) drive
+'   6. Write single byte to F:
+'   7. Read it back - verify match
+'   8. Unmount
+
+CON
+  _clkfreq = 300_000_000
+
+OBJ
+  fs : "flash_ram_fs"
+
+VAR
+  byte test_buffer[16]
+
+PUB main() | status, handle, value, read_value
+
+  waitms(100)
+
+  debug("===========================================")
+  debug("RT_smoke_test - Basic Functionality Test")
+  debug("===========================================")
+  debug(" ")
+
+  ' ========== TEST 1: Mount ==========
+  debug("TEST 1: Mount file system...")
+  status := fs.mount()
+  if status < 0
+    debug("  FAIL: mount() returned ", sdec(status))
+    debug("  Error: ", zstr_(fs.string_for_error(status)))
+    fail_and_halt()
+  else
+    debug("  PASS: mount() succeeded")
+  debug(" ")
+
+  ' ========== TEST 2: Format R: ==========
+  debug("TEST 2: Format R: (RAM) drive...")
+  status := fs.format(fs.DRIVE_R)
+  if status < 0
+    debug("  FAIL: format(DRIVE_R) returned ", sdec(status))
+    debug("  Error: ", zstr_(fs.string_for_error(status)))
+    fail_and_halt()
+  else
+    debug("  PASS: format(DRIVE_R) succeeded")
+  debug(" ")
+
+  ' ========== TEST 3: Write byte to R: ==========
+  debug("TEST 3: Write single byte to R:test.dat...")
+  handle := fs.open(@"R:test.dat", "w")
+  if handle < 0
+    debug("  FAIL: open() returned ", sdec(handle))
+    debug("  Error: ", zstr_(fs.string_for_error(handle)))
+    fail_and_halt()
+
+  value := $A5  ' test pattern
+  status := fs.wr_byte(handle, value)
+  if status < 0
+    debug("  FAIL: wr_byte() returned ", sdec(status))
+    debug("  Error: ", zstr_(fs.string_for_error(status)))
+    fs.close(handle)
+    fail_and_halt()
+
+  status := fs.close(handle)
+  if status < 0
+    debug("  FAIL: close() returned ", sdec(status))
+    debug("  Error: ", zstr_(fs.string_for_error(status)))
+    fail_and_halt()
+  else
+    debug("  PASS: wrote byte $A5 to R:test.dat")
+  debug(" ")
+
+  ' ========== TEST 4: Read byte from R: ==========
+  debug("TEST 4: Read byte back from R:test.dat...")
+  debug("  calling open()...")
+  handle := fs.open(@"R:test.dat", "r")
+  debug("  open() returned handle=", sdec(handle))
+  if handle < 0
+    debug("  FAIL: open() for read returned ", sdec(handle))
+    debug("  Error: ", zstr_(fs.string_for_error(handle)))
+    fail_and_halt()
+
+  debug("  calling rd_byte()...")
+  read_value := fs.rd_byte(handle)
+  debug("  rd_byte() returned ", sdec(read_value))
+  if read_value < 0
+    debug("  FAIL: rd_byte() returned ", sdec(read_value))
+    debug("  Error: ", zstr_(fs.string_for_error(read_value)))
+    fs.close(handle)
+    fail_and_halt()
+
+  fs.close(handle)
+
+  if read_value == value
+    debug("  PASS: read $", uhex_byte_(read_value), " matches written $", uhex_byte_(value))
+  else
+    debug("  FAIL: read $", uhex_byte_(read_value), " != written $", uhex_byte_(value))
+    fail_and_halt()
+  debug(" ")
+
+  ' ========== TEST 5: Format F: ==========
+  debug("TEST 5: Format F: (Flash) drive...")
+  debug("  (This may take a moment...)")
+  status := fs.format(fs.DRIVE_F)
+  if status < 0
+    debug("  FAIL: format(DRIVE_F) returned ", sdec(status))
+    debug("  Error: ", zstr_(fs.string_for_error(status)))
+    fail_and_halt()
+  else
+    debug("  PASS: format(DRIVE_F) succeeded")
+  debug(" ")
+
+  ' ========== TEST 6: Write byte to F: ==========
+  debug("TEST 6: Write single byte to F:test.dat...")
+  handle := fs.open(@"F:test.dat", "w")
+  if handle < 0
+    debug("  FAIL: open() returned ", sdec(handle))
+    debug("  Error: ", zstr_(fs.string_for_error(handle)))
+    fail_and_halt()
+
+  value := $5A  ' different test pattern
+  status := fs.wr_byte(handle, value)
+  if status < 0
+    debug("  FAIL: wr_byte() returned ", sdec(status))
+    debug("  Error: ", zstr_(fs.string_for_error(status)))
+    fs.close(handle)
+    fail_and_halt()
+
+  status := fs.close(handle)
+  if status < 0
+    debug("  FAIL: close() returned ", sdec(status))
+    debug("  Error: ", zstr_(fs.string_for_error(status)))
+    fail_and_halt()
+  else
+    debug("  PASS: wrote byte $5A to F:test.dat")
+  debug(" ")
+
+  ' ========== TEST 7: Read byte from F: ==========
+  debug("TEST 7: Read byte back from F:test.dat...")
+  handle := fs.open(@"F:test.dat", "r")
+  if handle < 0
+    debug("  FAIL: open() for read returned ", sdec(handle))
+    debug("  Error: ", zstr_(fs.string_for_error(handle)))
+    fail_and_halt()
+
+  read_value := fs.rd_byte(handle)
+  if read_value < 0
+    debug("  FAIL: rd_byte() returned ", sdec(read_value))
+    debug("  Error: ", zstr_(fs.string_for_error(read_value)))
+    fs.close(handle)
+    fail_and_halt()
+
+  fs.close(handle)
+
+  if read_value == value
+    debug("  PASS: read $", uhex_byte_(read_value), " matches written $", uhex_byte_(value))
+  else
+    debug("  FAIL: read $", uhex_byte_(read_value), " != written $", uhex_byte_(value))
+    fail_and_halt()
+  debug(" ")
+
+  ' ========== TEST 8: Unmount ==========
+  debug("TEST 8: Unmount file system...")
+  status := fs.unmount()
+  if status < 0
+    debug("  FAIL: unmount() returned ", sdec(status))
+    debug("  Error: ", zstr_(fs.string_for_error(status)))
+    fail_and_halt()
+  else
+    debug("  PASS: unmount() succeeded")
+  debug(" ")
+
+  ' ========== ALL PASSED ==========
+  debug("===========================================")
+  debug("ALL 8 TESTS PASSED!")
+  debug("===========================================")
+  debug(" ")
+  debug("END_SESSION")
+  repeat
+
+PRI fail_and_halt()
+  debug(" ")
+  debug("===========================================")
+  debug("TEST FAILED - Halting")
+  debug("===========================================")
+  debug(" ")
+  debug("END_SESSION")
+  repeat

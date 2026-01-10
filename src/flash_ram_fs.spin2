@@ -1,0 +1,4160 @@
+'' =================================================================================================
+''
+''   File....... flash_ram_fs.spin2
+''   Purpose.... Dual-device file system driver for P2-EC32MB (Flash F: + PSRAM R:)
+''               Provides unified F:/R: API with seamless access to both Flash and PSRAM storage
+''   Author..... Iron Sheep Productions, LLC
+''               Based on flash_fs.spin2 by Chip Gracey, Jon McPhalen, Stephen M Moraco
+''   E-mail..... stephen@ironsheep.biz
+''   Started.... JAN 2026
+''   Updated.... 08 JAN 2026
+''
+'' =================================================================================================
+'' v0.1.0 - initial skeleton with dual-device architecture
+'' -------------------------------------------------------------------------------------------------
+
+CON { version }
+
+  LIB_VERSION = 010                                     ' 0.1.0
+
+  #true,  ON, OFF
+  #false, NO, YES
+
+
+CON { file open mode equivalents }
+
+  ' File open mode equivalents (values match %"r+", %"w+" encoding)
+  FILEMODE_READ = $72                                   ' "r"
+  FILEMODE_WRITE = $77                                  ' "w"
+  FILEMODE_APPEND = $61                                 ' "a"
+  FILEMODE_READ_EXTENDED = $2B72                        ' "r+"
+  FILEMODE_WRITE_EXTENDED = $2B77                       ' "w+"
+
+
+CON { drive identifiers }
+
+  ' Drive letter constants for device selection
+  DRIVE_NONE     = 0                                    ' No drive specified (defaults to F:)
+  DRIVE_F        = 1                                    ' Flash drive F:
+  DRIVE_R        = 2                                    ' RAM/PSRAM drive R:
+  DRIVE_BOTH     = 3                                    ' Both drives (for mount/format/unmount)
+
+
+CON { fixed I/O pins - SPI Flash }
+
+  ' P2-EC32MB Flash chip (W25Q128JVSIM)
+  PGM_RX   = 63  { I }                                  ' programming / debug
+  PGM_TX   = 62  { O }
+
+  SF_CS    = 61  { O }                                  ' flash chip select
+  SF_SCLK  = 60  { O }                                  ' flash clock
+  SF_MOSI  = 59  { O }                                  ' flash data in
+  SF_MISO  = 58  { I }                                  ' flash data out
+
+
+CON { fixed I/O pins - QSPI PSRAM }
+
+  ' P2-EC32MB PSRAM chips (4x APS6404L-3SQR-ZR, 8MB each = 32MB total)
+  ' QSPI interface on pins P40-P57
+  RAM_CS   = 57  { O }                                  ' PSRAM chip select (directly drive)
+  RAM_CK   = 56  { O }                                  ' PSRAM clock (smart pin)
+
+  ' Data pins are P40-P55 (directly controlled via DIRB pattern)
+  RAM_DATA_BASE = 40                                    ' First data pin
+  RAM_DATA_PINS = 16                                    ' Number of data pins (quad x 4 chips)
+
+  ' PSRAM smart pin and streamer configuration
+  _RAM_DIRPAT   = $00FF_FF00                            ' Data pins direction pattern
+  _RAM_CMDBIT8  = $00D0_0008                            ' 8-bit command streamer config
+  _RAM_CMDNIB8  = $20D0_0008                            ' 8-nibble command streamer config
+  _RAM_CMDNIBN  = $20D0_0000 + 23                       ' N-nibble command streamer config
+  _RAM_CMDRW    = $F0D0_0000                            ' Read/write streamer command
+
+
+CON { PUBLIC driver constants }
+
+  ' Return Codes (compatible with flash_fs.spin2)
+  OKAY             = 0                                  ' No error / Success
+  SUCCESS          = OKAY                               ' No error / Success
+
+  ' SK_* ENUM values (parameter to seek() method)
+  #0, SK_Unknown, SK_FILE_START, SK_CURRENT_POSN
+
+  ' Error codes (compatible with flash_fs.spin2)
+  E_BAD_HANDLE     = -1                                 ' Handle is invalid
+  E_NO_HANDLE      = -2                                 ' Out of available handles
+  E_FILE_NOT_FOUND = -3                                 ' File not present
+  E_DRIVE_FULL     = -4                                 ' Out of space on device
+  E_FILE_WRITING   = -5                                 ' File is open for writing
+  E_FILE_READING   = -6                                 ' File is open for reading
+  E_FILE_OPEN      = -7                                 ' File is open
+  E_FILE_EXISTS    = -8                                 ' File already exists
+  E_END_OF_FILE    = -9                                 ' No more data, at end of file
+  E_FILE_MODE      = -10                                ' File not opened in desired mode
+  E_FILE_SEEK      = -11                                ' Attempted seek past end of file
+  E_BAD_BLOCKS_REMOVED = -12                            ' Block bit failure, bad blocks removed
+  E_NO_LOCK_AVAIL  = -13                                ' Unable to obtain LOCK for driver
+  E_TRUNCATED_STRING = -14                              ' Buffer full before string terminator
+  E_INCOMPLETE_STRING = -15                             ' EOF reached before string terminator
+  E_SHORT_TRANSER = -16                                 ' Too few bytes read or written (matches flash_fs typo)
+  E_NOT_MOUNTED    = -17                                ' Filesystem NOT mounted
+  E_BAD_FILE_LENGTH = -18                               ' File length is negative or zero
+  E_BAD_SEEK_ARG   = -19                                ' Invalid seek argument
+
+  ' New error codes for dual-device driver
+  E_BAD_DRIVE      = -20                                ' Invalid drive letter
+  E_NOT_CONTIGUOUS = -21                                ' File not allocated contiguously
+  E_CONTIGUOUS_FULL = -22                               ' No contiguous space available
+  E_RAM_ONLY       = -23                                ' Operation only valid on R: drive
+  E_FLASH_ONLY     = -24                                ' Operation only valid on F: drive
+  E_CROSS_DEVICE   = -25                                ' Operation cannot cross devices
+  E_FRAGMENTED     = -26                                ' RAM too fragmented for allocation
+
+
+CON { PRIVATE driver constants }
+
+  ' Block geometry (same for both devices)
+  BLOCK_SIZE       = $1000                              ' 4KB block size (4096 bytes)
+  BLOCK_SIZE_EXP   = encod BLOCK_SIZE
+
+  ' Flash geometry (W25Q128JVSIM = 16MB)
+  FLASH_FIRST_BLOCK = $080                              ' First block (skip 512KB boot area)
+  FLASH_LAST_BLOCK  = $FFF                              ' Last block
+  FLASH_BLOCKS      = FLASH_LAST_BLOCK - FLASH_FIRST_BLOCK + 1  ' 3,968 blocks
+
+  ' RAM geometry (4x APS6404L = 32MB)
+  RAM_FIRST_BLOCK  = $000                               ' First block
+  RAM_LAST_BLOCK   = $1FFF                              ' Last block (8,192 blocks)
+  RAM_BLOCKS       = RAM_LAST_BLOCK - RAM_FIRST_BLOCK + 1       ' 8,192 blocks
+
+  ' Handle configuration
+  MAX_FILES_OPEN   = 4                                  ' Maximum concurrent open files
+
+  ' Block header offsets (common)
+  ADDR_HEAD_FN_CRC  = $004                              ' Filename CRC offset in head block
+  ADDR_HEAD_SONAME  = $008                              ' Filename start offset in head block
+  ADDR_CONTIGUOUS   = $080                              ' Contiguous start block (RAM only, 4 bytes)
+  ADDR_CIRCULAR_LEN = $084                              ' Circular length (4 bytes)
+  ADDR_HEAD_DATA    = $088                              ' Data start offset in head block
+  ADDR_BODY_DATA    = $004                              ' Data start offset in body block
+  ADDR_BLOCK_CRC    = $FFC                              ' CRC location at end of block
+
+  FILENAME_SIZE    = $088 - $008                        ' 128 bytes for filename
+
+  ' Block data capacities (same for both Flash and RAM - 4KB blocks)
+  BYTES_IN_HEAD_BLOCK = 3956                            ' Head block data bytes (4096-140)
+  WORDS_IN_HEAD_BLOCK = BYTES_IN_HEAD_BLOCK / 2
+  LONGS_IN_HEAD_BLOCK = BYTES_IN_HEAD_BLOCK / 4
+  BYTES_IN_BODY_BLOCK = 4088                            ' Body block data bytes (4096-8)
+  WORDS_IN_BODY_BLOCK = BYTES_IN_BODY_BLOCK / 2
+  LONGS_IN_BODY_BLOCK = BYTES_IN_BODY_BLOCK / 4
+
+  ' Aliases for Flash drive (same values)
+  FLASH_BYTES_IN_HEAD_BLOCK = BYTES_IN_HEAD_BLOCK
+  FLASH_WORDS_IN_HEAD_BLOCK = WORDS_IN_HEAD_BLOCK
+  FLASH_LONGS_IN_HEAD_BLOCK = LONGS_IN_HEAD_BLOCK
+  FLASH_BYTES_IN_BODY_BLOCK = BYTES_IN_BODY_BLOCK
+  FLASH_WORDS_IN_BODY_BLOCK = WORDS_IN_BODY_BLOCK
+  FLASH_LONGS_IN_BODY_BLOCK = LONGS_IN_BODY_BLOCK
+
+  ' Aliases for RAM drive (same values)
+  RAM_BYTES_IN_HEAD_BLOCK = BYTES_IN_HEAD_BLOCK
+  RAM_WORDS_IN_HEAD_BLOCK = WORDS_IN_HEAD_BLOCK
+  RAM_LONGS_IN_HEAD_BLOCK = LONGS_IN_HEAD_BLOCK
+  RAM_BYTES_IN_BODY_BLOCK = BYTES_IN_BODY_BLOCK
+  RAM_WORDS_IN_BODY_BLOCK = WORDS_IN_BODY_BLOCK
+  RAM_LONGS_IN_BODY_BLOCK = LONGS_IN_BODY_BLOCK
+
+  ' Array sizes for Flash
+  FLASH_ID_TO_BLOCKS_SZ = (FLASH_BLOCKS * 12 + 15) / 16 ' 12-bit fields in WORD array
+  FLASH_FLAGS_SIZE      = (FLASH_BLOCKS * 1 + 7) / 8    ' 1-bit fields in BYTE array
+  FLASH_STATES_SIZE     = (FLASH_BLOCKS * 2 + 7) / 8    ' 2-bit fields in BYTE array
+
+  ' Array sizes for RAM
+  RAM_ID_TO_BLOCKS_SZ   = (RAM_BLOCKS * 13 + 15) / 16   ' 13-bit fields in WORD array
+  RAM_FLAGS_SIZE        = (RAM_BLOCKS * 1 + 7) / 8      ' 1-bit fields in BYTE array
+  RAM_STATES_SIZE       = (RAM_BLOCKS * 2 + 7) / 8      ' 2-bit fields in BYTE array
+
+  ' Block states (2 bits each)
+  B_FREE           = %00                                ' Block is not in use
+  B_TEMP           = %01                                ' Block is being allocated
+  B_HEAD           = %10                                ' Block is head of file
+  B_BODY           = %11                                ' Block is body of file
+
+  ' Handle status flags
+  H_READ           = %0001                              ' File open for reading
+  H_WRITE          = %0010                              ' File open for writing
+  H_FORK           = %0100                              ' File being rewritten/appended
+  H_MODIFY         = %1000                              ' File being modified in place
+
+  H_APPEND         = H_WRITE | H_FORK
+  H_READWRITE      = H_WRITE | H_MODIFY
+  H_READ_WRITE     = H_READ | H_WRITE
+
+  ' Special values
+  NOT_ENABLED      = -1                                 ' Feature not enabled
+  NOT_VALID        = -30                                ' Value not initialized
+
+
+DAT { pre-initialized: driver state tracking }
+
+'-------+-----+---------+-------+---------------+-------+-----------------------+
+' Per-cog error tracking
+errorCode       LONG      0[8]                          ' Most recent error per cog
+
+' Locks for concurrent access (dual-lock architecture)
+flashLock       LONG      -1                            ' Flash device lock
+ramLock         LONG      -1                            ' RAM device lock
+
+' Mount state
+flashMounted    LONG      false                         ' Flash mounted flag
+ramMounted      LONG      false                         ' RAM mounted flag
+
+' Handle availability
+fsFreeHndlCt    LONG      MAX_FILES_OPEN                ' Available handle count
+
+' Lock acquisition timing (multi-cog mount support)
+fsCogCts        LONG      $7fff_ffff[8]                 ' Cog timestamp for lock race
+
+
+DAT { pre-initialized: Flash block management tables }
+
+' Flash ID-to-block translation (12-bit fields)
+FlashIDToBlocks WORD      0[FLASH_ID_TO_BLOCKS_SZ]
+FlashIDToBlock  LONG      0                             ' Field pointer
+
+' Flash ID validity flags (1-bit per block)
+FlashIDValids   BYTE      0[FLASH_FLAGS_SIZE]
+FlashIDValid    LONG      0                             ' Field pointer
+
+' Flash block states (2-bit per block)
+FlashBlockStates BYTE     0[FLASH_STATES_SIZE]
+FlashBlockState LONG      0                             ' Field pointer
+
+
+DAT { pre-initialized: RAM block management tables }
+
+' RAM ID-to-block translation (13-bit fields for 8192 blocks)
+RAMIDToBlocks   WORD      0[RAM_ID_TO_BLOCKS_SZ]
+RAMIDToBlock    LONG      0                             ' Field pointer
+
+' RAM ID validity flags (1-bit per block)
+RAMIDValids     BYTE      0[RAM_FLAGS_SIZE]
+RAMIDValid      LONG      0                             ' Field pointer
+
+' RAM block states (2-bit per block)
+RAMBlockStates  BYTE      0[RAM_STATES_SIZE]
+RAMBlockState   LONG      0                             ' Field pointer
+
+
+DAT { pre-initialized: PSRAM driver cog state }
+
+' PSRAM driver runs in dedicated cog for multi-cog file system support
+' Each cog has its own command slot: [hub_addr, psram_long_addr, long_count]
+' Negative long_count = write (hub->PSRAM), positive = read (PSRAM->hub)
+' Driver clears long_count to 0 when transfer completes
+psramCog        LONG      0                             ' PSRAM driver cog ID + 1 (0 = not running)
+psram_cmd_list  LONG      0[8 * 3]                      ' Command list: 8 cogs x 3 longs each
+
+
+DAT { pre-initialized: handle tracking }
+
+' Handle state arrays
+hDevice         BYTE      0[MAX_FILES_OPEN]             ' Device: DRIVE_F or DRIVE_R
+hStatus         BYTE      0[MAX_FILES_OPEN]             ' Handle status flags
+hHeadBlockID    WORD      NOT_VALID[MAX_FILES_OPEN]     ' First block ID of file
+hChainBlockID   WORD      0[MAX_FILES_OPEN]             ' First block of commit chain
+hChainBlockAddr WORD      0[MAX_FILES_OPEN]             ' First block address of commit chain
+hChainLifeCycle BYTE      0[MAX_FILES_OPEN]             ' Lifecycle for Flash blocks
+hModified       BYTE      0[MAX_FILES_OPEN]             ' Block modified flag
+hEndPtr         WORD      0[MAX_FILES_OPEN]             ' Next byte pointer in block
+hSeekPtr        LONG      NOT_ENABLED[MAX_FILES_OPEN]   ' Seek pointer within block
+hSeekFileOffset LONG      0[MAX_FILES_OPEN]             ' Seek offset within file
+hCircularLength LONG      0[MAX_FILES_OPEN]             ' Circular buffer length
+hContiguousBase LONG      0[MAX_FILES_OPEN]             ' Base address for contiguous files (RAM only)
+hFilename       BYTE      0[MAX_FILES_OPEN * FILENAME_SIZE]   ' Filename buffers
+hBlockBuff      BYTE      0[MAX_FILES_OPEN * BLOCK_SIZE]      ' 4KB block buffers
+
+' Temporary buffer for block operations
+tmpBlockBuffer  BYTE      0[BLOCK_SIZE]
+
+
+CON ' ==================== PUBLIC METHODS ====================
+
+
+PUB null()
+'' This is not an application
+'' -- invoke format() or mount() to use the file system
+
+
+PUB version() : result
+'' Returns library version as integer (e.g., 100 = 1.0.0)
+  LONG[@errorCode][cogid()] := SUCCESS
+  return LIB_VERSION
+
+
+CON ' --- Mount/Unmount Operations ---
+
+
+PUB mount() : status | flash_status, ram_status
+'' Mount both F: and R: devices atomically
+'' @returns status - SUCCESS, E_NO_LOCK_AVAIL, E_BAD_BLOCKS_REMOVED
+
+  ' Check if already mounted
+  if flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := SUCCESS)
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Setup Flash semaphore if needed
+  if flashLock == -1
+    if setup_flash_semaphore() < 0
+      return LONG[@errorCode][cogid()]
+
+  ' Setup RAM semaphore if needed
+  if ramLock == -1
+    if setup_ram_semaphore() < 0
+      return LONG[@errorCode][cogid()]
+
+  ' Acquire Flash lock
+  repeat while locktry(flashLock) == 0
+
+  ' Acquire RAM lock
+  repeat while locktry(ramLock) == 0
+
+  ' Clear handles
+  bytefill(@hStatus, 0, MAX_FILES_OPEN)
+  fsFreeHndlCt := MAX_FILES_OPEN
+
+  ' Initialize Flash device (scans blocks, rebuilds tables)
+  flash_status := flash_init()
+  if flash_status == E_BAD_BLOCKS_REMOVED
+    status := E_BAD_BLOCKS_REMOVED
+
+  ' Initialize RAM device (clears arrays, sets up QSPI pins)
+  ram_status := ram_init()
+
+  ' Both devices mounted successfully
+  flashMounted := true
+  ramMounted := true
+
+  ' Release locks
+  lockrel(ramLock)
+  lockrel(flashLock)
+
+
+PUB unmount() : status | handle, tmpFlashLock, tmpRamLock, tmpStatus
+'' Unmount both devices, flush buffers, release locks
+'' @returns status - SUCCESS, E_NOT_MOUNTED
+
+  ' Check if mounted
+  ifnot flashMounted or ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Acquire locks for exclusive access
+  repeat while locktry(flashLock) == 0
+  repeat while locktry(ramLock) == 0
+
+  status := (LONG[@errorCode][cogid()] := SUCCESS)
+
+  ' Close any open files
+  repeat MAX_FILES_OPEN with handle
+    if hStatus[handle]~                                   ' If handle is open (post reset)
+      tmpStatus := close_no_lock(handle)                  ' Close it without acquiring lock again
+      if tmpStatus < 0
+        status := tmpStatus
+      hCircularLength[handle] := 0
+
+  ' Reset handle pool
+  fsFreeHndlCt := MAX_FILES_OPEN
+
+  ' Save locks for lockret after clearing
+  tmpFlashLock := flashLock
+  tmpRamLock := ramLock
+  flashLock := -1
+  ramLock := -1
+
+  ' Clear mounted flags
+  flashMounted := false
+  ramMounted := false
+
+  ' Stop PSRAM driver cog
+  psram_stop_driver()
+
+  ' Release and return locks
+  lockrel(tmpRamLock)
+  lockret(tmpRamLock)
+  lockrel(tmpFlashLock)
+  lockret(tmpFlashLock)
+
+
+PUB format(device) : status | block_address, cycleBits
+'' Format specified device(s)
+'' @param device - DRIVE_F, DRIVE_R, or DRIVE_BOTH
+'' @returns status - SUCCESS, E_BAD_DRIVE, E_NOT_MOUNTED
+
+  ' Validate device parameter
+  if device <> DRIVE_F and device <> DRIVE_R and device <> DRIVE_BOTH
+    return (LONG[@errorCode][cogid()] := E_BAD_DRIVE)
+
+  ' Setup semaphores if needed
+  if flashLock == -1
+    if setup_flash_semaphore() < 0
+      return LONG[@errorCode][cogid()]
+  if ramLock == -1
+    if setup_ram_semaphore() < 0
+      return LONG[@errorCode][cogid()]
+
+  ' Acquire appropriate locks
+  if device & DRIVE_F
+    repeat while locktry(flashLock) == 0
+  if device & DRIVE_R
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Format Flash device (cancel all active blocks)
+  if device & DRIVE_F
+    repeat FLASH_BLOCKS with block_address
+      flash_read_block(block_address, @cycleBits, $000, $000)
+      if lookdown(cycleBits.[7..5] : %011, %101, %110)
+        flash_cancel_block(block_address)
+    flashMounted := false
+
+  ' Format RAM device (clear all block states)
+  if device & DRIVE_R
+    bytefill(@RAMBlockStates, 0, RAM_STATES_SIZE)
+    bytefill(@RAMIDValids, 0, RAM_FLAGS_SIZE)
+    bytefill(@RAMIDToBlocks, 0, RAM_ID_TO_BLOCKS_SZ * 2)
+    ramMounted := false
+
+  ' Release locks
+  if device & DRIVE_R
+    lockrel(ramLock)
+  if device & DRIVE_F
+    lockrel(flashLock)
+
+  ' Remount the formatted device(s)
+  return mount()
+
+
+PUB mounted() : device_flags
+'' Returns which devices are mounted
+'' @returns device_flags - DRIVE_NONE, DRIVE_F, DRIVE_R, or DRIVE_BOTH
+  if flashMounted and ramMounted
+    return DRIVE_BOTH
+  elseif flashMounted
+    return DRIVE_F
+  elseif ramMounted
+    return DRIVE_R
+  return DRIVE_NONE
+
+
+PUB error() : status
+'' Returns error code from most recent operation
+  return LONG[@errorCode][cogid()]
+
+
+CON ' --- File Operations ---
+
+
+PUB open(p_filename, mode) : handle | device, p_name, fileFound
+'' Open file with drive prefix (F: or R:, defaults to F:)
+'' @param p_filename - "F:name", "R:name", or "name" (defaults to F:)
+'' @param mode - "r", "w", "a", "r+", "w+"
+'' @returns handle - 0..MAX_FILES_OPEN-1, or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Check handles available
+  if fsFreeHndlCt == 0
+    return (LONG[@errorCode][cogid()] := E_NO_HANDLE)
+
+  ' Parse drive letter and get pointer to actual filename
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Validate mode and check space for write modes
+  case mode
+    "r", "R":                                             ' Read mode - no space check
+    "a", "A", "w", "W", FILEMODE_READ_EXTENDED, FILEMODE_WRITE_EXTENDED:
+      ' Check for available space
+      if device == DRIVE_F
+        ifnot flash_blocks_free()
+          return (LONG[@errorCode][cogid()] := E_DRIVE_FULL)
+      else
+        ifnot ram_blocks_free()
+          return (LONG[@errorCode][cogid()] := E_DRIVE_FULL)
+    other:
+      return (LONG[@errorCode][cogid()] := E_FILE_MODE)
+
+  ' Acquire appropriate lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+  handle := NOT_VALID
+
+  ' Check if file exists
+  fileFound := exists_no_lock(device, p_name)
+
+  ' Check mode requirements
+  case mode
+    "r", "R", FILEMODE_READ_EXTENDED:
+      ifnot fileFound
+        handle := (LONG[@errorCode][cogid()] := E_FILE_NOT_FOUND)
+
+  ' Check if file is already open
+  if handle == NOT_VALID and is_file_open_device(device, p_name, H_READ_WRITE)
+    handle := (LONG[@errorCode][cogid()] := E_FILE_OPEN)
+
+  ' Check handles again after acquiring lock
+  if handle == NOT_VALID and fsFreeHndlCt == 0
+    handle := (LONG[@errorCode][cogid()] := E_NO_HANDLE)
+
+  ' If error, release lock and return
+  if LONG[@errorCode][cogid()] <> SUCCESS
+    if device == DRIVE_F
+      lockrel(flashLock)
+    else
+      lockrel(ramLock)
+    return handle
+
+  ' Open file based on mode
+  case mode
+    "r", "R":
+      handle := finish_open_read(device, p_name, 0)
+    "w", "W":
+      handle := finish_open_write(device, p_name, 0)
+    "a", "A":
+      if fileFound
+        handle := finish_open_append(device, p_name, 0)
+      else
+        handle := finish_open_write(device, p_name, 0)
+    FILEMODE_READ_EXTENDED, FILEMODE_WRITE_EXTENDED:
+      handle := finish_open_readwrite(device, p_name)
+
+  if handle < 0
+    LONG[@errorCode][cogid()] := handle
+
+
+PUB open_circular(p_filename, mode, max_file_length) : handle | device, p_name, file_exists
+'' Open circular file (ring buffer) with max size
+'' @param p_filename - filename with optional drive prefix
+'' @param mode - "r" to read, "a" to append (creates if not exist)
+'' @param max_file_length - maximum file size in bytes
+'' @returns handle - handle or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate max_file_length
+  if max_file_length < 1
+    return (LONG[@errorCode][cogid()] := E_BAD_FILE_LENGTH)
+
+  ' Validate mode
+  case mode
+    "r", "R":
+    "a", "A":
+    other: return (LONG[@errorCode][cogid()] := E_FILE_MODE)
+
+  ' Parse drive letter
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+  handle := NOT_VALID
+
+  ' Check file existence
+  file_exists := exists_no_lock(device, p_name)
+
+  ' Validate based on mode
+  case mode
+    "r", "R":
+      ifnot file_exists
+        handle := (LONG[@errorCode][cogid()] := E_FILE_NOT_FOUND)
+    "a", "A":
+      if device == DRIVE_F
+        ifnot flash_blocks_free()
+          handle := (LONG[@errorCode][cogid()] := E_DRIVE_FULL)
+      else
+        ifnot ram_blocks_free()
+          handle := (LONG[@errorCode][cogid()] := E_DRIVE_FULL)
+
+  ' Check if file is already open
+  if handle == NOT_VALID and is_file_open_device(device, p_name, H_READ_WRITE)
+    handle := (LONG[@errorCode][cogid()] := E_FILE_OPEN)
+
+  ' If error, release lock and return
+  if LONG[@errorCode][cogid()] <> SUCCESS
+    if device == DRIVE_F
+      lockrel(flashLock)
+    else
+      lockrel(ramLock)
+    return
+
+  ' Open file with circular length
+  case mode
+    "a", "A":
+      if file_exists
+        handle := finish_open_append(device, p_name, max_file_length)
+      else
+        handle := finish_open_write(device, p_name, max_file_length)
+    "r", "R":
+      handle := finish_open_read(device, p_name, max_file_length)
+
+  if handle < 0
+    LONG[@errorCode][cogid()] := handle
+
+
+PUB close(handle) : status | device
+'' Close file, flush pending writes
+'' @param handle - handle to close
+'' @returns status - SUCCESS or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle
+  if handle < 0 or handle >= MAX_FILES_OPEN
+    return (LONG[@errorCode][cogid()] := E_BAD_HANDLE)
+
+  device := hDevice[handle]
+
+  ' Acquire appropriate lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  ' Close the file
+  status := close_no_lock(handle)
+  hCircularLength[handle] := 0
+  hHeadBlockID[handle] := NOT_VALID
+
+  fsFreeHndlCt++
+  hStatus[handle]~
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB flush(handle) : status | device
+'' Flush pending writes without closing
+'' @param handle - handle to flush
+'' @returns status - SUCCESS or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle
+  if handle < 0 or handle >= MAX_FILES_OPEN
+    return (LONG[@errorCode][cogid()] := E_BAD_HANDLE)
+
+  device := hDevice[handle]
+
+  ' Acquire appropriate lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Flush based on mode
+  case hStatus[handle]
+    H_WRITE, H_APPEND:
+      ' Close and reopen in append mode
+      close_no_lock(handle)
+      start_modify(handle, H_APPEND, hHeadBlockID[handle], $FFFFFF, true)
+    H_READWRITE:
+      ' Write modified block if dirty
+      if hModified[handle]
+        rewrite_block(handle)
+    other:
+      LONG[@errorCode][cogid()] := E_FILE_MODE
+
+  hModified[handle]~
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+CON ' --- Read/Write Operations ---
+
+
+PUB read(handle, p_buffer, count) : bytes_read | device, status, byte_value
+'' Read bytes from file
+'' @param handle - file handle
+'' @param p_buffer - destination buffer
+'' @param count - bytes to read
+'' @returns bytes_read - actual bytes read
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    LONG[@errorCode][cogid()] := E_NOT_MOUNTED
+    return 0
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_READ | H_READWRITE)
+  if status <> SUCCESS
+    LONG[@errorCode][cogid()] := status
+    return 0
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+  bytes_read := 0
+
+  ' Read bytes one at a time
+  repeat count
+    byte_value := read_byte_internal(handle)
+    if byte_value < 0
+      quit                                                ' EOF or error
+    BYTE[p_buffer++] := byte_value
+    bytes_read++
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB write(handle, p_buffer, count) : bytes_written | device, status, byte_value
+'' Write bytes to file
+'' @param handle - file handle
+'' @param p_buffer - source buffer
+'' @param count - bytes to write
+'' @returns bytes_written - actual bytes written
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    LONG[@errorCode][cogid()] := E_NOT_MOUNTED
+    return 0
+
+  ' Validate handle and mode (write requires write mode)
+  status := ensure_handle_mode(handle, H_WRITE | H_APPEND | H_READWRITE)
+  if status <> SUCCESS
+    LONG[@errorCode][cogid()] := status
+    return 0
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+  bytes_written := 0
+
+  ' Write bytes one at a time
+  repeat count
+    byte_value := BYTE[p_buffer++]
+    status := write_byte_internal(handle, byte_value)
+    if status < 0
+      LONG[@errorCode][cogid()] := status
+      quit
+    bytes_written++
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB rd_byte(handle) : byte_value | device, status
+'' Read single byte
+'' @param handle - file handle
+'' @returns byte_value - byte read or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_READ | H_READWRITE)
+  if status <> SUCCESS
+    return (LONG[@errorCode][cogid()] := status)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+  byte_value := read_byte_internal(handle)
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB rd_word(handle) : word_value | device, status, lo_byte, hi_byte
+'' Read 16-bit word (little endian)
+'' @param handle - file handle
+'' @returns word_value - word read or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_READ | H_READWRITE)
+  if status <> SUCCESS
+    return (LONG[@errorCode][cogid()] := status)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Read two bytes (little endian)
+  lo_byte := read_byte_internal(handle)
+  if lo_byte >= 0
+    hi_byte := read_byte_internal(handle)
+    if hi_byte >= 0
+      word_value := hi_byte << 8 | lo_byte
+    else
+      word_value := E_END_OF_FILE
+  else
+    word_value := E_END_OF_FILE
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB rd_long(handle) : long_value | device, status, b0, b1, b2, b3
+'' Read 32-bit long (little endian)
+'' @param handle - file handle
+'' @returns long_value - long read or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_READ | H_READWRITE)
+  if status <> SUCCESS
+    return (LONG[@errorCode][cogid()] := status)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Read four bytes (little endian)
+  b0 := read_byte_internal(handle)
+  if b0 >= 0
+    b1 := read_byte_internal(handle)
+    if b1 >= 0
+      b2 := read_byte_internal(handle)
+      if b2 >= 0
+        b3 := read_byte_internal(handle)
+        if b3 >= 0
+          long_value := b3 << 24 | b2 << 16 | b1 << 8 | b0
+        else
+          long_value := E_END_OF_FILE
+      else
+        long_value := E_END_OF_FILE
+    else
+      long_value := E_END_OF_FILE
+  else
+    long_value := E_END_OF_FILE
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB rd_str(handle, p_str, count) : bytes_read | device, status, byte_value
+'' Read null-terminated string
+'' @param handle - file handle
+'' @param p_str - destination buffer
+'' @param count - max bytes to read (including null)
+'' @returns bytes_read - bytes read (not including null)
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    LONG[@errorCode][cogid()] := E_NOT_MOUNTED
+    return 0
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_READ | H_READWRITE)
+  if status <> SUCCESS
+    LONG[@errorCode][cogid()] := status
+    return 0
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+  bytes_read := 0
+
+  ' Read until null terminator or max count
+  repeat count - 1                                        ' Leave room for null
+    byte_value := read_byte_internal(handle)
+    if byte_value < 0
+      LONG[@errorCode][cogid()] := E_INCOMPLETE_STRING
+      quit
+    BYTE[p_str++] := byte_value
+    bytes_read++
+    if byte_value == 0
+      bytes_read--                                        ' Don't count null in return
+      quit
+
+  ' Ensure null termination
+  BYTE[p_str] := 0
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB wr_byte(handle, byte_value) : status | device
+'' Write single byte
+'' @param handle - file handle
+'' @param byte_value - byte to write
+'' @returns status - SUCCESS or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_WRITE | H_APPEND | H_READWRITE)
+  if status <> SUCCESS
+    return (LONG[@errorCode][cogid()] := status)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  status := write_byte_internal(handle, byte_value)
+  LONG[@errorCode][cogid()] := status
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB wr_word(handle, word_value) : status | device
+'' Write 16-bit word (little endian)
+'' @param handle - file handle
+'' @param word_value - word to write
+'' @returns status - SUCCESS or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_WRITE | H_APPEND | H_READWRITE)
+  if status <> SUCCESS
+    return (LONG[@errorCode][cogid()] := status)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  ' Write two bytes (little endian)
+  status := write_byte_internal(handle, word_value & $FF)
+  if status >= 0
+    status := write_byte_internal(handle, word_value >> 8 & $FF)
+
+  LONG[@errorCode][cogid()] := status
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB wr_long(handle, long_value) : status | device
+'' Write 32-bit long (little endian)
+'' @param handle - file handle
+'' @param long_value - long to write
+'' @returns status - SUCCESS or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_WRITE | H_APPEND | H_READWRITE)
+  if status <> SUCCESS
+    return (LONG[@errorCode][cogid()] := status)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  ' Write four bytes (little endian)
+  status := write_byte_internal(handle, long_value & $FF)
+  if status >= 0
+    status := write_byte_internal(handle, long_value >> 8 & $FF)
+    if status >= 0
+      status := write_byte_internal(handle, long_value >> 16 & $FF)
+      if status >= 0
+        status := write_byte_internal(handle, long_value >> 24 & $FF)
+
+  LONG[@errorCode][cogid()] := status
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB wr_str(handle, p_str) : status | device, byte_value
+'' Write null-terminated string (including null)
+'' @param handle - file handle
+'' @param p_str - pointer to string
+'' @returns status - SUCCESS or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle and mode
+  status := ensure_handle_mode(handle, H_WRITE | H_APPEND | H_READWRITE)
+  if status <> SUCCESS
+    return (LONG[@errorCode][cogid()] := status)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Write string including null terminator
+  repeat
+    byte_value := BYTE[p_str++]
+    status := write_byte_internal(handle, byte_value)
+    if status < 0
+      LONG[@errorCode][cogid()] := status
+      quit
+  until byte_value == 0
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+CON ' --- Seek Operations ---
+
+
+PUB seek(handle, position, whence) : end_position | device, status, file_size_bytes
+'' Seek to position in file
+'' @param handle - file handle
+'' @param position - byte offset
+'' @param whence - SK_FILE_START or SK_CURRENT_POSN
+'' @returns end_position - resulting position or error
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle and mode (seek requires read mode)
+  status := ensure_handle_mode(handle, H_READ | H_READWRITE)
+  if status <> SUCCESS
+    return (LONG[@errorCode][cogid()] := status)
+
+  ' Validate whence parameter
+  if whence <> SK_FILE_START and whence <> SK_CURRENT_POSN
+    return (LONG[@errorCode][cogid()] := E_BAD_SEEK_ARG)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Calculate target position
+  case whence
+    SK_FILE_START:
+      end_position := position
+    SK_CURRENT_POSN:
+      end_position := hSeekFileOffset[handle] + position
+
+  ' Validate position (can't seek to negative)
+  if end_position < 0
+    LONG[@errorCode][cogid()] := E_FILE_SEEK
+    end_position := E_FILE_SEEK
+
+  ' For circular files, limit seek to circular length
+  elseif hCircularLength[handle] > 0 and end_position > hCircularLength[handle]
+    LONG[@errorCode][cogid()] := E_FILE_SEEK
+    end_position := E_FILE_SEEK
+
+  else
+    ' Get file size to validate seek doesn't go past end
+    file_size_bytes := count_file_bytes_internal(handle)
+
+    if end_position > file_size_bytes
+      LONG[@errorCode][cogid()] := E_FILE_SEEK
+      end_position := E_FILE_SEEK
+    else
+      ' Perform seek - position to correct block and offset
+      seek_to_position(handle, end_position)
+      hSeekFileOffset[handle] := end_position
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+CON ' --- File Management ---
+
+
+PUB exists(p_filename) : found | device, p_name
+'' Check if file exists
+'' @param p_filename - filename with optional drive prefix
+'' @returns found - true if file exists
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    LONG[@errorCode][cogid()] := E_NOT_MOUNTED
+    return false
+
+  ' Parse drive letter
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+  found := exists_no_lock(device, p_name)
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB delete(p_filename) : status | device, p_name, signature
+'' Delete a file
+'' @param p_filename - filename to delete
+'' @returns status - SUCCESS or error
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Parse drive letter
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Acquire appropriate lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  status := (LONG[@errorCode][cogid()] := SUCCESS)
+
+  ' Check if file is open
+  if is_file_open_device(device, p_name, H_READ_WRITE)
+    status := (LONG[@errorCode][cogid()] := E_FILE_OPEN)
+
+  ' Check if file exists and get head signature
+  elseifnot signature := get_file_head_signature_device(device, p_name)
+    status := (LONG[@errorCode][cogid()] := E_FILE_NOT_FOUND)
+
+  else
+    ' Delete the file chain
+    delete_chain_from_id(device, signature.[19..8], false)
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB rename(p_old_filename, p_new_filename) : status | old_device, new_device, p_old_name, p_new_name, signature, new_block_address, cur_block_address, next_cycle_bits
+'' Rename a file (same device only)
+'' @param p_old_filename - current filename
+'' @param p_new_filename - new filename
+'' @returns status - SUCCESS or error
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Parse drive letters
+  old_device, p_old_name := parse_drive_letter(p_old_filename)
+  new_device, p_new_name := parse_drive_letter(p_new_filename)
+
+  ' Rename must be same device
+  if old_device <> new_device
+    return (LONG[@errorCode][cogid()] := E_CROSS_DEVICE)
+
+  ' Acquire appropriate lock
+  if old_device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Check if old file is open
+  if is_file_open_device(old_device, p_old_name, H_READ_WRITE)
+    status := (LONG[@errorCode][cogid()] := E_FILE_OPEN)
+
+  ' Check if new file is open
+  elseif is_file_open_device(old_device, p_new_name, H_READ_WRITE)
+    status := (LONG[@errorCode][cogid()] := E_FILE_OPEN)
+
+  ' Check for available space (Flash needs new block for rename)
+  elseif old_device == DRIVE_F
+    ifnot flash_blocks_free()
+      status := (LONG[@errorCode][cogid()] := E_DRIVE_FULL)
+
+  ' Check if new file already exists
+  elseif get_file_head_signature_device(old_device, p_new_name)
+    status := (LONG[@errorCode][cogid()] := E_FILE_EXISTS)
+
+  ' Check if old file exists
+  elseifnot signature := get_file_head_signature_device(old_device, p_old_name)
+    status := (LONG[@errorCode][cogid()] := E_FILE_NOT_FOUND)
+
+  else
+    ' Perform the rename
+    if old_device == DRIVE_F
+      ' Flash rename: write new head block with new filename, cancel old
+      new_block_address := flash_allocate_block()
+      cur_block_address := field[FlashIDToBlock][signature.[19..8]]
+      flash_read_block(cur_block_address, @tmpBlockBuffer, $000, $FFF)
+      LONG[@tmpBlockBuffer][1].[31..12] := filename_crc(p_new_name)
+      bytefill(@tmpBlockBuffer + $008, $E5, FILENAME_SIZE)
+      strcopy(@tmpBlockBuffer + $008, p_new_name, FILENAME_SIZE - 1)
+      next_cycle_bits := flash_next_active_cycle(BYTE[@tmpBlockBuffer].[7..5])
+      flash_write_block(new_block_address, @tmpBlockBuffer, next_cycle_bits)
+      flash_activate_block(new_block_address, next_cycle_bits)
+      flash_cancel_block(cur_block_address)
+      field[FlashIDToBlock][signature.[19..8]] := new_block_address
+      field[FlashBlockState][new_block_address] := B_HEAD
+      field[FlashBlockState][cur_block_address] := B_FREE
+    else
+      ' RAM rename: update filename in place
+      cur_block_address := field[RAMIDToBlock][signature.[19..8]]
+      ram_read_block(cur_block_address, @tmpBlockBuffer, $000, $FFF)
+      LONG[@tmpBlockBuffer][1].[31..12] := filename_crc(p_new_name)
+      bytefill(@tmpBlockBuffer + $008, $E5, FILENAME_SIZE)
+      strcopy(@tmpBlockBuffer + $008, p_new_name, FILENAME_SIZE - 1)
+      ram_write_block(cur_block_address, @tmpBlockBuffer)
+
+  ' Release lock
+  if old_device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB create_file(p_filename, fill_value, byte_count) : status
+'' Create file with specified size and fill value
+'' @param p_filename - filename with optional drive prefix
+'' @param fill_value - byte value to fill
+'' @param byte_count - file size
+'' @returns status - SUCCESS or error
+  ' TODO: Implement
+  return E_NOT_MOUNTED
+
+
+PUB file_size(p_filename) : size_in_bytes | device, p_name, signature, block_id
+'' Get file size
+'' @param p_filename - filename with optional drive prefix
+'' @returns size_in_bytes - size or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Parse drive letter
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Find file
+  signature := get_file_head_signature_device(device, p_name)
+  if signature == 0
+    size_in_bytes := (LONG[@errorCode][cogid()] := E_FILE_NOT_FOUND)
+  else
+    ' Count bytes in file chain
+    block_id := signature.[19..8]
+    size_in_bytes := count_file_bytes_device(device, block_id)
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB file_size_for_handle(handle) : size_in_bytes | device, status
+'' Get file size for open file
+'' @param handle - file handle
+'' @returns size_in_bytes - size or error code
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate handle
+  if handle < 0 or handle >= MAX_FILES_OPEN
+    return (LONG[@errorCode][cogid()] := E_BAD_HANDLE)
+
+  ifnot hStatus[handle]
+    return (LONG[@errorCode][cogid()] := E_BAD_HANDLE)
+
+  device := hDevice[handle]
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  else
+    repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Count bytes in file chain
+  size_in_bytes := count_file_bytes_device(device, hHeadBlockID[handle])
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB is_circular_handle(handle) : isCircular
+'' Check if handle is for a circular file
+'' @param handle - file handle
+'' @returns isCircular - true if circular file
+
+  ' Validate handle
+  if handle < 0 or handle >= MAX_FILES_OPEN
+    return false
+  ifnot hStatus[handle]
+    return false
+
+  return hCircularLength[handle] > 0
+
+
+PUB circular_max_size(handle) : max_size
+'' Get maximum size of circular file
+'' @param handle - file handle
+'' @returns max_size - circular limit in bytes, or 0 if not circular
+
+  ' Validate handle
+  if handle < 0 or handle >= MAX_FILES_OPEN
+    return 0
+  ifnot hStatus[handle]
+    return 0
+
+  return hCircularLength[handle]
+
+
+CON ' --- Directory Operations ---
+
+
+PUB directory(device, p_block_id, p_filename, p_file_size) : status | block_id, block_address, max_blocks
+'' Get next file in directory listing
+'' @param device - DRIVE_F or DRIVE_R (DRIVE_BOTH not supported - use dir_fs wrapper)
+'' @param p_block_id - pointer to block ID (init to 0, auto-advanced)
+'' @param p_filename - buffer for filename (128 bytes)
+'' @param p_file_size - pointer to receive file size
+'' @returns status - SUCCESS if file found, E_END_OF_FILE if no more files
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate device
+  if device == DRIVE_F
+    max_blocks := FLASH_BLOCKS
+    repeat while locktry(flashLock) == 0
+  elseif device == DRIVE_R
+    max_blocks := RAM_BLOCKS
+    repeat while locktry(ramLock) == 0
+  else
+    return (LONG[@errorCode][cogid()] := E_BAD_DRIVE)
+
+  LONG[@errorCode][cogid()] := SUCCESS
+  BYTE[p_filename][0] := 0                              ' Reset filename (empty string)
+  LONG[p_file_size] := 0                                ' Reset file size
+
+  ' Scan remaining block IDs for HEAD blocks
+  repeat while LONG[p_block_id] < max_blocks
+    block_id := LONG[p_block_id]++                      ' Get current block ID and post-increment
+
+    if device == DRIVE_F
+      if field[FlashIDValid][block_id]                  ' Block ID valid?
+        block_address := field[FlashIDToBlock][block_id]
+        if field[FlashBlockState][block_address] == B_HEAD
+          ' Found a HEAD block - read filename
+          flash_read_block(block_address, p_filename, $008, $087)
+          ' Get file size
+          LONG[p_file_size], _, _ := count_file_bytes(block_address)
+          ' Release lock and return success
+          lockrel(flashLock)
+          return SUCCESS
+    else
+      if field[RAMIDValid][block_id]                    ' Block ID valid?
+        block_address := field[RAMIDToBlock][block_id]
+        if field[RAMBlockState][block_address] == B_HEAD
+          ' Found a HEAD block - read filename
+          ram_read_block(block_address, p_filename, $008, $087)
+          ' Get file size
+          LONG[p_file_size] := count_file_bytes_ram(block_address)
+          ' Release lock and return success
+          lockrel(ramLock)
+          return SUCCESS
+
+  ' No more files found
+  status := E_END_OF_FILE
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PUB stats(device) : used_blocks, free_blocks, file_count | block_address
+'' Get device statistics
+'' @param device - DRIVE_F or DRIVE_R
+'' @returns used_blocks, free_blocks, file_count
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED), 0, 0
+
+  ' Acquire lock
+  if device == DRIVE_F
+    repeat while locktry(flashLock) == 0
+  elseif device == DRIVE_R
+    repeat while locktry(ramLock) == 0
+  else
+    return (LONG[@errorCode][cogid()] := E_BAD_DRIVE), 0, 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Count blocks by state
+  used_blocks := 0
+  free_blocks := 0
+  file_count := 0
+
+  if device == DRIVE_F
+    repeat FLASH_BLOCKS with block_address
+      case field[FlashBlockState][block_address]
+        B_FREE: free_blocks++
+        B_TEMP: used_blocks++
+        B_HEAD:
+          used_blocks++
+          file_count++
+        B_BODY: used_blocks++
+    lockrel(flashLock)
+  else
+    repeat RAM_BLOCKS with block_address
+      case field[RAMBlockState][block_address]
+        B_FREE: free_blocks++
+        B_TEMP: used_blocks++
+        B_HEAD:
+          used_blocks++
+          file_count++
+        B_BODY: used_blocks++
+    lockrel(ramLock)
+
+
+CON ' --- Cross-Device Operations ---
+
+
+PUB copy_file(p_src_filename, p_dest_filename) : status | src_handle, dest_handle, bytes_read, bytes_written, copy_buffer
+'' Copy file (same device or cross-device F: <-> R:)
+'' @param p_src_filename - source filename with drive prefix
+'' @param p_dest_filename - destination filename with drive prefix
+'' @returns status - SUCCESS or error
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Allocate copy buffer from tmpBlockBuffer
+  copy_buffer := @tmpBlockBuffer
+
+  ' Open source file for reading
+  src_handle := open(p_src_filename, "r")
+  if src_handle < 0
+    return src_handle
+
+  ' Open destination file for writing
+  dest_handle := open(p_dest_filename, "w")
+  if dest_handle < 0
+    close(src_handle)
+    return dest_handle
+
+  ' Copy data in chunks
+  status := SUCCESS
+  repeat
+    bytes_read := read(src_handle, copy_buffer, BLOCK_SIZE)
+    if bytes_read <= 0
+      quit
+    bytes_written := write(dest_handle, copy_buffer, bytes_read)
+    if bytes_written <> bytes_read
+      status := E_SHORT_TRANSER
+      quit
+
+  ' Close files
+  close(dest_handle)
+  close(src_handle)
+
+  ' If copy failed, delete partial destination
+  if status <> SUCCESS
+    delete(p_dest_filename)
+
+
+CON ' --- RAM-Only Operations (Contiguous Files) ---
+
+
+PUB create_contiguous(p_filename, size_in_bytes) : status | device, p_name, blocks_needed, first_block, blk_idx, p_buffer, signature
+'' Create contiguous file on R: for hardware-accelerated access
+'' @param p_filename - must be "R:name" (RAM only)
+'' @param size_in_bytes - file size (rounded up to block boundary)
+'' @returns status - SUCCESS, E_RAM_ONLY, E_CONTIGUOUS_FULL, E_BAD_FILE_LENGTH
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate size
+  if size_in_bytes < 1
+    return (LONG[@errorCode][cogid()] := E_BAD_FILE_LENGTH)
+
+  ' Parse drive letter
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Contiguous files are RAM only
+  if device <> DRIVE_R
+    return (LONG[@errorCode][cogid()] := E_RAM_ONLY)
+
+  ' Acquire RAM lock
+  repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Delete existing file if present
+  if exists_no_lock(device, p_name)
+    signature := get_file_head_signature_device(device, p_name)
+    delete_chain_from_id(device, signature.[19..8], false)
+
+  ' Calculate blocks needed (round up)
+  blocks_needed := (size_in_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE
+
+  ' Allocate contiguous blocks
+  first_block := ram_allocate_contiguous(blocks_needed)
+  if first_block < 0
+    lockrel(ramLock)
+    return (LONG[@errorCode][cogid()] := first_block)
+
+  ' Build HEAD block with contiguous info
+  p_buffer := @tmpBlockBuffer
+  bytefill(p_buffer, $FF, BLOCK_SIZE)
+
+  ' Signature: block_id in [19..8], is_body=0, is_last=0 (contiguous has no chain)
+  LONG[p_buffer] := first_block << 8
+
+  ' Filename CRC
+  LONG[p_buffer + ADDR_HEAD_FN_CRC].[31..12] := filename_crc(p_name)
+
+  ' Copy filename
+  bytefill(p_buffer + ADDR_HEAD_SONAME, $E5, FILENAME_SIZE)
+  strcopy(p_buffer + ADDR_HEAD_SONAME, p_name, FILENAME_SIZE - 1)
+
+  ' Store contiguous start block and size
+  LONG[p_buffer + ADDR_CONTIGUOUS] := first_block | (blocks_needed << 16)
+
+  ' Store total size in signature's end pointer area (bits [31..20])
+  ' For contiguous files, we use a special marker
+  LONG[p_buffer].[31..20] := size_in_bytes <# $FFF           ' Store up to 4095 bytes
+
+  ' Calculate and store CRC
+  LONG[p_buffer + ADDR_BLOCK_CRC] := block_crc(p_buffer)
+
+  ' Write HEAD block to first contiguous block
+  ram_write_block(first_block, p_buffer)
+
+  ' Mark first block as HEAD, rest as BODY
+  field[RAMBlockState][first_block] := B_HEAD
+  field[RAMIDValid][first_block]~~
+  field[RAMIDToBlock][first_block] := first_block
+
+  repeat blocks_needed - 1 with blk_idx
+    field[RAMBlockState][first_block + blk_idx + 1] := B_BODY
+    field[RAMIDValid][first_block + blk_idx + 1]~~
+    field[RAMIDToBlock][first_block + blk_idx + 1] := first_block + blk_idx + 1
+
+  lockrel(ramLock)
+
+
+PUB get_address(p_filename) : psram_address | device, p_name, signature, block_id, block_address, contiguous_info
+'' Get raw PSRAM address for contiguous file
+'' @param p_filename - must be "R:name" and file must be contiguous
+'' @returns psram_address - raw PSRAM byte address, 0 if not contiguous/not found
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    LONG[@errorCode][cogid()] := E_NOT_MOUNTED
+    return 0
+
+  ' Parse drive letter
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Contiguous files are RAM only
+  if device <> DRIVE_R
+    LONG[@errorCode][cogid()] := E_RAM_ONLY
+    return 0
+
+  ' Acquire RAM lock
+  repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Find file
+  signature := get_file_head_signature_device(device, p_name)
+  if signature == 0
+    LONG[@errorCode][cogid()] := E_FILE_NOT_FOUND
+    lockrel(ramLock)
+    return 0
+
+  ' Get block address and read contiguous info
+  block_id := signature.[19..8]
+  block_address := field[RAMIDToBlock][block_id]
+  ram_read_block(block_address, @contiguous_info, ADDR_CONTIGUOUS, ADDR_CONTIGUOUS + 3)
+
+  ' Check if file is contiguous (non-zero contiguous info)
+  if contiguous_info == 0 or contiguous_info == $FFFFFFFF
+    LONG[@errorCode][cogid()] := E_NOT_CONTIGUOUS
+    lockrel(ramLock)
+    return 0
+
+  ' Extract start block from contiguous info (lower 16 bits)
+  block_id := contiguous_info & $FFFF
+
+  ' Calculate raw PSRAM address
+  ' PSRAM starts after the FS reserved area
+  psram_address := block_id * BLOCK_SIZE
+
+  lockrel(ramLock)
+
+
+PUB is_contiguous(p_filename) : isContiguous | device, p_name, signature, block_id, block_address, contiguous_info
+'' Check if file is contiguous
+'' @param p_filename - filename with optional drive prefix
+'' @returns isContiguous - true if contiguous RAM file
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return false
+
+  ' Parse drive letter
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Only RAM files can be contiguous
+  if device <> DRIVE_R
+    return false
+
+  ' Acquire RAM lock
+  repeat while locktry(ramLock) == 0
+
+  ' Find file
+  signature := get_file_head_signature_device(device, p_name)
+  if signature == 0
+    lockrel(ramLock)
+    return false
+
+  ' Get block address and read contiguous info
+  block_id := signature.[19..8]
+  block_address := field[RAMIDToBlock][block_id]
+  ram_read_block(block_address, @contiguous_info, ADDR_CONTIGUOUS, ADDR_CONTIGUOUS + 3)
+
+  lockrel(ramLock)
+
+  ' File is contiguous if contiguous info is non-zero and not all-FF
+  return contiguous_info <> 0 and contiguous_info <> $FFFFFFFF
+
+
+PUB contiguous_size(p_filename) : size_in_bytes | device, p_name, signature, block_id, block_address, contiguous_info
+'' Get size of contiguous file in bytes
+'' @param p_filename - filename with optional drive prefix
+'' @returns size_in_bytes - size or 0 if not contiguous
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return 0
+
+  ' Parse drive letter
+  device, p_name := parse_drive_letter(p_filename)
+
+  ' Only RAM files can be contiguous
+  if device <> DRIVE_R
+    return 0
+
+  ' Acquire RAM lock
+  repeat while locktry(ramLock) == 0
+
+  ' Find file
+  signature := get_file_head_signature_device(device, p_name)
+  if signature == 0
+    lockrel(ramLock)
+    return 0
+
+  ' Get block address and read contiguous info
+  block_id := signature.[19..8]
+  block_address := field[RAMIDToBlock][block_id]
+  ram_read_block(block_address, @contiguous_info, ADDR_CONTIGUOUS, ADDR_CONTIGUOUS + 3)
+
+  lockrel(ramLock)
+
+  ' Check if contiguous
+  if contiguous_info == 0 or contiguous_info == $FFFFFFFF
+    return 0
+
+  ' Calculate size from block count (upper 16 bits)
+  size_in_bytes := (contiguous_info >> 16) * BLOCK_SIZE
+
+
+PUB stream_read(psram_address, p_hub_buffer, byte_count) : status
+'' High-speed streaming read from PSRAM (bypasses file system)
+'' @param psram_address - raw PSRAM address from get_address()
+'' @param p_hub_buffer - hub RAM destination
+'' @param byte_count - bytes to transfer (must be multiple of 4)
+'' @returns status - SUCCESS or error
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate parameters
+  if byte_count < 1
+    return (LONG[@errorCode][cogid()] := E_BAD_FILE_LENGTH)
+
+  ' Acquire RAM lock for PSRAM access
+  repeat while locktry(ramLock) == 0
+
+  ' Perform direct PSRAM read
+  psram_read(psram_address, p_hub_buffer, byte_count)
+
+  lockrel(ramLock)
+  return (LONG[@errorCode][cogid()] := SUCCESS)
+
+
+PUB stream_write(psram_address, p_hub_buffer, byte_count) : status
+'' High-speed streaming write to PSRAM (bypasses file system)
+'' @param psram_address - raw PSRAM address from get_address()
+'' @param p_hub_buffer - hub RAM source
+'' @param byte_count - bytes to transfer (must be multiple of 4)
+'' @returns status - SUCCESS or error
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    return (LONG[@errorCode][cogid()] := E_NOT_MOUNTED)
+
+  ' Validate parameters
+  if byte_count < 1
+    return (LONG[@errorCode][cogid()] := E_BAD_FILE_LENGTH)
+
+  ' Acquire RAM lock for PSRAM access
+  repeat while locktry(ramLock) == 0
+
+  ' Perform direct PSRAM write
+  psram_write(psram_address, p_hub_buffer, byte_count)
+
+  lockrel(ramLock)
+  return (LONG[@errorCode][cogid()] := SUCCESS)
+
+
+PUB contiguous_status() : total_free, largest_free, fragment_count, compactable | blk_addr, in_free_region, region_size, max_region
+'' Get RAM fragmentation status
+'' @returns total_free - total free bytes
+'' @returns largest_free - largest contiguous free region (bytes)
+'' @returns fragment_count - number of separate free regions
+'' @returns compactable - max achievable free region after compact (bytes)
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    LONG[@errorCode][cogid()] := E_NOT_MOUNTED
+    return 0, 0, 0, 0
+
+  ' Acquire RAM lock
+  repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  total_free := 0
+  largest_free := 0
+  fragment_count := 0
+  in_free_region := false
+  region_size := 0
+
+  ' Scan all RAM blocks
+  repeat RAM_BLOCKS with blk_addr
+    if field[RAMBlockState][blk_addr] == B_FREE
+      total_free++
+      if not in_free_region
+        ' Start of new free region
+        in_free_region := true
+        fragment_count++
+        region_size := 1
+      else
+        region_size++
+      ' Track largest region
+      if region_size > max_region
+        max_region := region_size
+    else
+      if in_free_region
+        ' End of free region
+        in_free_region := false
+        if region_size > largest_free
+          largest_free := region_size
+
+  ' Check final region
+  if in_free_region and region_size > largest_free
+    largest_free := region_size
+
+  ' Convert to bytes
+  total_free *= BLOCK_SIZE
+  largest_free *= BLOCK_SIZE
+
+  ' Compactable is total_free (in ideal case all free space is contiguous)
+  compactable := total_free
+
+  lockrel(ramLock)
+
+
+PUB fragmentation_percent() : percent | total_free, largest_free, fragment_count, compactable
+'' Calculate RAM fragmentation percentage
+'' @returns percent - 0% = no fragmentation, 100% = maximum fragmentation
+
+  total_free, largest_free, fragment_count, compactable := contiguous_status()
+
+  if total_free == 0
+    return 0
+
+  ' Fragmentation = 100 - (largest_free * 100 / total_free)
+  percent := 100 - (largest_free * 100 / total_free)
+
+
+PUB compact_needed() : needed | total_free, largest_free, fragment_count, compactable
+'' Check if compaction would be beneficial
+'' @returns needed - true if compactable > largest_free * 2
+
+  total_free, largest_free, fragment_count, compactable := contiguous_status()
+
+  return compactable > (largest_free * 2)
+
+
+PUB compact() : bytes_reclaimed, largest_available | blk_addr, best_block, best_score, score, free_above, free_below, src_addr, dest_addr
+'' Move one regular file block to consolidate free space
+'' Contiguous files are NOT moved (hardware addresses cached)
+'' @returns bytes_reclaimed - bytes of new contiguous free space
+'' @returns largest_available - largest free region after operation
+
+  ' Check if mounted
+  ifnot flashMounted and ramMounted
+    LONG[@errorCode][cogid()] := E_NOT_MOUNTED
+    return 0, 0
+
+  ' Acquire RAM lock
+  repeat while locktry(ramLock) == 0
+
+  LONG[@errorCode][cogid()] := SUCCESS
+
+  ' Find the BODY block with maximum (free_above + free_below)
+  ' This block, when moved, will merge the most free space
+  best_block := -1
+  best_score := 0
+
+  repeat RAM_BLOCKS with blk_addr
+    if field[RAMBlockState][blk_addr] == B_BODY
+      ' Count free blocks above
+      free_above := 0
+      if blk_addr > 0
+        src_addr := blk_addr - 1
+        repeat while src_addr >= 0 and field[RAMBlockState][src_addr] == B_FREE
+          free_above++
+          src_addr--
+
+      ' Count free blocks below
+      free_below := 0
+      if blk_addr < RAM_BLOCKS - 1
+        src_addr := blk_addr + 1
+        repeat while src_addr < RAM_BLOCKS and field[RAMBlockState][src_addr] == B_FREE
+          free_below++
+          src_addr++
+
+      ' Score is sum of adjacent free blocks
+      score := free_above + free_below
+      if score > best_score
+        best_score := score
+        best_block := blk_addr
+
+  ' If no suitable block found, nothing to compact
+  if best_block < 0 or best_score == 0
+    lockrel(ramLock)
+    _, largest_available, _, _ := contiguous_status()
+    return 0, largest_available
+
+  ' Find a free block at the edge (beginning of RAM)
+  dest_addr := -1
+  repeat RAM_BLOCKS with blk_addr
+    if field[RAMBlockState][blk_addr] == B_FREE
+      dest_addr := blk_addr
+      quit
+
+  if dest_addr < 0
+    lockrel(ramLock)
+    return 0, 0
+
+  ' Move block from best_block to dest_addr
+  ' Read source block
+  ram_read_block(best_block, @tmpBlockBuffer, $000, $FFF)
+
+  ' Write to destination
+  ram_write_block(dest_addr, @tmpBlockBuffer)
+
+  ' Update block state tracking
+  field[RAMBlockState][dest_addr] := field[RAMBlockState][best_block]
+  field[RAMIDValid][dest_addr] := field[RAMIDValid][best_block]
+  field[RAMIDToBlock][field[RAMBlockState][best_block]] := dest_addr
+
+  ' Mark old location as free
+  field[RAMBlockState][best_block] := B_FREE
+  field[RAMIDValid][best_block] := false
+
+  ' TODO: Update chain pointers in preceding block to point to new location
+  ' This is complex and requires finding the block that chains to best_block
+
+  bytes_reclaimed := best_score * BLOCK_SIZE
+
+  lockrel(ramLock)
+
+  _, largest_available, _, _ := contiguous_status()
+
+
+PUB compact_all() : total_bytes_reclaimed | bytes_reclaimed, largest
+'' Compact RAM until no more space can be reclaimed
+'' @returns total_bytes_reclaimed - total bytes of new contiguous free space
+
+  repeat
+    bytes_reclaimed, largest := compact()
+    total_bytes_reclaimed += bytes_reclaimed
+  while bytes_reclaimed > 0
+
+
+CON ' --- Serial Number ---
+
+
+PUB serial_number() : sn_hi, sn_lo
+'' Returns 64-bit unique ID of Flash chip
+'' @returns sn_hi, sn_lo - upper and lower 32 bits
+  ' TODO: Implement (copy from flash_fs)
+  return 0, 0
+
+
+CON ' --- Error Strings ---
+
+
+PUB string_for_error(status) : p_interpretation
+'' Return string description of error code
+'' @param status - error code
+'' @returns p_interpretation - pointer to error string
+  case status
+    SUCCESS:                p_interpretation := @"SUCCESS: No error"
+    E_BAD_HANDLE:           p_interpretation := @"E_BAD_HANDLE: Handle is invalid"
+    E_NO_HANDLE:            p_interpretation := @"E_NO_HANDLE: Out of available handles"
+    E_FILE_NOT_FOUND:       p_interpretation := @"E_FILE_NOT_FOUND: File not present"
+    E_DRIVE_FULL:           p_interpretation := @"E_DRIVE_FULL: Out of space on device"
+    E_FILE_WRITING:         p_interpretation := @"E_FILE_WRITING: File is open for writing"
+    E_FILE_READING:         p_interpretation := @"E_FILE_READING: File is open for reading"
+    E_FILE_OPEN:            p_interpretation := @"E_FILE_OPEN: File is open"
+    E_FILE_EXISTS:          p_interpretation := @"E_FILE_EXISTS: File already exists"
+    E_END_OF_FILE:          p_interpretation := @"E_END_OF_FILE: End of file reached"
+    E_FILE_MODE:            p_interpretation := @"E_FILE_MODE: Invalid file mode"
+    E_FILE_SEEK:            p_interpretation := @"E_FILE_SEEK: Seek past end of file"
+    E_BAD_BLOCKS_REMOVED:   p_interpretation := @"E_BAD_BLOCKS_REMOVED: Bad blocks removed"
+    E_NO_LOCK_AVAIL:        p_interpretation := @"E_NO_LOCK_AVAIL: No lock available"
+    E_TRUNCATED_STRING:     p_interpretation := @"E_TRUNCATED_STRING: String truncated"
+    E_INCOMPLETE_STRING:    p_interpretation := @"E_INCOMPLETE_STRING: String incomplete"
+    E_SHORT_TRANSER:        p_interpretation := @"E_SHORT_TRANSER: Transfer incomplete"
+    E_NOT_MOUNTED:          p_interpretation := @"E_NOT_MOUNTED: Filesystem not mounted"
+    E_BAD_FILE_LENGTH:      p_interpretation := @"E_BAD_FILE_LENGTH: Invalid file length"
+    E_BAD_SEEK_ARG:         p_interpretation := @"E_BAD_SEEK_ARG: Invalid seek argument"
+    E_BAD_DRIVE:            p_interpretation := @"E_BAD_DRIVE: Invalid drive letter"
+    E_NOT_CONTIGUOUS:       p_interpretation := @"E_NOT_CONTIGUOUS: File not contiguous"
+    E_CONTIGUOUS_FULL:      p_interpretation := @"E_CONTIGUOUS_FULL: No contiguous space"
+    E_RAM_ONLY:             p_interpretation := @"E_RAM_ONLY: Operation only valid on R:"
+    E_FLASH_ONLY:           p_interpretation := @"E_FLASH_ONLY: Operation only valid on F:"
+    E_CROSS_DEVICE:         p_interpretation := @"E_CROSS_DEVICE: Cannot cross devices"
+    E_FRAGMENTED:           p_interpretation := @"E_FRAGMENTED: RAM too fragmented"
+    other:                  p_interpretation := @"???: Unknown error code"
+
+
+CON ' ==================== PRIVATE METHODS ====================
+
+CON ' --- Drive Letter Parsing ---
+
+
+PRI parse_drive_letter(p_filename) : device, p_name | first_char, second_char
+'' Parse "F:", "R:", or no prefix from filename
+'' @param p_filename - filename possibly with drive prefix
+'' @returns device - DRIVE_F, DRIVE_R (defaults to F: if no prefix)
+'' @returns p_name - pointer to filename after any prefix
+'' Edge case: "README.txt" is NOT parsed as R: drive (requires colon)
+
+  device := DRIVE_F                                     ' Default to Flash
+  p_name := p_filename
+
+  ' Check for drive letter prefix (X:)
+  first_char := BYTE[p_filename]
+  second_char := BYTE[p_filename + 1]
+
+  if second_char == ":"                                 ' Must have colon to be drive letter
+    case first_char
+      "F", "f":                                         ' Flash drive
+        device := DRIVE_F
+        p_name := p_filename + 2
+      "R", "r":                                         ' RAM drive
+        device := DRIVE_R
+        p_name := p_filename + 2
+      ' Any other letter with colon is invalid - will be caught by file operations
+
+
+CON ' --- Handle Management ---
+
+
+PRI allocate_handle(device) : handle
+'' Allocate handle for device
+'' @param device - DRIVE_F or DRIVE_R
+'' @returns handle - 0..MAX_FILES_OPEN-1 or E_NO_HANDLE
+
+  if fsFreeHndlCt == 0
+    return E_NO_HANDLE
+
+  ' Find first free handle
+  repeat MAX_FILES_OPEN with handle
+    ifnot hStatus[handle]                               ' Status = 0 means free
+      ' Initialize handle
+      hDevice[handle] := device
+      hStatus[handle] := 0                              ' Will be set by open
+      hHeadBlockID[handle] := NOT_VALID
+      hChainBlockID[handle] := 0
+      hModified[handle] := 0
+      hEndPtr[handle] := 0
+      hSeekPtr[handle] := NOT_ENABLED
+      hSeekFileOffset[handle] := 0
+      hCircularLength[handle] := 0
+      hContiguousBase[handle] := 0
+      fsFreeHndlCt--
+      return handle
+
+  return E_NO_HANDLE
+
+
+PRI free_handle(handle)
+'' Free a handle
+'' @param handle - handle to free (0 to MAX_FILES_OPEN-1)
+
+  if handle >= 0 and handle < MAX_FILES_OPEN
+    if hStatus[handle]                                  ' Only free if in use
+      hStatus[handle] := 0
+      hDevice[handle] := DRIVE_NONE
+      hHeadBlockID[handle] := NOT_VALID
+      fsFreeHndlCt++
+
+
+PRI get_handle_device(handle) : device
+'' Get device for handle
+'' @param handle - file handle
+'' @returns device - DRIVE_F, DRIVE_R, or DRIVE_NONE if invalid
+
+  if handle >= 0 and handle < MAX_FILES_OPEN
+    if hStatus[handle]                                  ' Handle is in use
+      return hDevice[handle]
+  return DRIVE_NONE
+
+
+PRI ensure_handle_mode(handle, required_mode) : status
+'' Verify handle is valid and in required mode
+'' @param handle - file handle
+'' @param required_mode - H_READ, H_WRITE, H_MODIFY, etc. (can be OR'd)
+'' @returns status - SUCCESS or E_BAD_HANDLE or E_FILE_MODE
+
+  ' Validate handle range
+  if handle < 0 or handle >= MAX_FILES_OPEN
+    return E_BAD_HANDLE
+
+  ' Check handle is in use
+  ifnot hStatus[handle]
+    return E_BAD_HANDLE
+
+  ' Check mode matches (any bit match is OK)
+  if hStatus[handle] & required_mode
+    return SUCCESS
+
+  ' Mode doesn't match
+  if required_mode & H_READ
+    return E_FILE_READING
+  if required_mode & H_WRITE
+    return E_FILE_WRITING
+  return E_FILE_MODE
+
+
+CON ' --- Lock Management ---
+
+
+PRI acquire_flash_lock()
+'' Acquire Flash device lock (blocking)
+  repeat while locktry(flashLock) == 0
+
+
+PRI release_flash_lock()
+'' Release Flash device lock
+  lockrel(flashLock)
+
+
+PRI acquire_ram_lock()
+'' Acquire RAM device lock (blocking)
+  repeat while locktry(ramLock) == 0
+
+
+PRI release_ram_lock()
+'' Release RAM device lock
+  lockrel(ramLock)
+
+
+PRI acquire_both_locks()
+'' Acquire both locks (always Flash first, then RAM to prevent deadlock)
+  acquire_flash_lock()
+  acquire_ram_lock()
+
+
+PRI release_both_locks()
+'' Release both locks (release RAM first, then Flash)
+  release_ram_lock()
+  release_flash_lock()
+
+
+PUB get_error() : status
+'' Get most recent error code for calling cog
+'' @returns status - error code
+  return LONG[@errorCode][cogid()]
+
+
+PUB set_error(status)
+'' Set error code for calling cog
+'' @param status - error code to set
+  LONG[@errorCode][cogid()] := status
+
+
+PUB clear_error()
+'' Clear error code for calling cog
+  LONG[@errorCode][cogid()] := SUCCESS
+
+
+PRI setup_flash_semaphore() : status
+'' Initialize Flash lock (first caller allocates, others wait)
+'' @returns status - SUCCESS or E_NO_LOCK_AVAIL
+
+  if flashLock == -1
+    ifnot can_acquire_flash_lock()
+      ' Not first - wait for allocation to complete
+      repeat
+        if flashLock <> -1
+          quit
+    else
+      ' First to mount - allocate the lock
+      flashLock := locknew()
+      if flashLock < 0
+        return (LONG[@errorCode][cogid()] := E_NO_LOCK_AVAIL)
+  return SUCCESS
+
+
+PRI setup_ram_semaphore() : status
+'' Initialize RAM lock (first caller allocates, others wait)
+'' @returns status - SUCCESS or E_NO_LOCK_AVAIL
+
+  if ramLock == -1
+    ifnot can_acquire_ram_lock()
+      ' Not first - wait for allocation to complete
+      repeat
+        if ramLock <> -1
+          quit
+    else
+      ' First to mount - allocate the lock
+      ramLock := locknew()
+      if ramLock < 0
+        return (LONG[@errorCode][cogid()] := E_NO_LOCK_AVAIL)
+  return SUCCESS
+
+
+PRI can_acquire_flash_lock() : bItsMe | myCogId, tmpCogId, lowestValue, lowestID
+'' Determine if first or subsequent caller for Flash lock
+'' @returns bItsMe - true if first caller and should acquire lock
+
+  lowestValue := $7fff_ffff                               ' Max signed long value
+  bItsMe := false
+
+  if flashLock == -1
+    myCogId := cogid()
+    LONG[@fsCogCts][myCogId] := getct()                   ' Set our cog timer value
+    waitms(10)                                            ' Let other cogs get in here too
+    repeat tmpCogId from 0 to 7
+      if LONG[@fsCogCts][tmpCogId] < lowestValue
+        lowestValue := LONG[@fsCogCts][tmpCogId]
+        lowestID := tmpCogId
+    bItsMe := (lowestID == myCogId)
+
+
+PRI can_acquire_ram_lock() : bItsMe | myCogId, tmpCogId, lowestValue, lowestID
+'' Determine if first or subsequent caller for RAM lock
+'' @returns bItsMe - true if first caller and should acquire lock
+'' Note: Uses same fsCogCts array - called sequentially after Flash setup
+
+  lowestValue := $7fff_ffff                               ' Max signed long value
+  bItsMe := false
+
+  if ramLock == -1
+    myCogId := cogid()
+    LONG[@fsCogCts][myCogId] := getct()                   ' Set our cog timer value
+    waitms(10)                                            ' Let other cogs get in here too
+    repeat tmpCogId from 0 to 7
+      if LONG[@fsCogCts][tmpCogId] < lowestValue
+        lowestValue := LONG[@fsCogCts][tmpCogId]
+        lowestID := tmpCogId
+    bItsMe := (lowestID == myCogId)
+
+
+CON ' --- Flash Block Layer ---
+
+
+PRI flash_init() : status | block_address, block_type_bits, signature
+'' Initialize Flash hardware and scan blocks
+'' Rebuilds ID-to-block tables and block states from Flash contents
+'' @returns status - SUCCESS or E_BAD_BLOCKS_REMOVED if bad blocks found
+
+  status := SUCCESS
+
+  ' Initialize Flash block management arrays
+  bytefill(@FlashIDToBlocks, 0, FLASH_ID_TO_BLOCKS_SZ * 2)
+  bytefill(@FlashIDValids, 0, FLASH_FLAGS_SIZE)
+  bytefill(@FlashBlockStates, 0, FLASH_STATES_SIZE)
+
+  ' Setup field pointers for bit-field access
+  FlashIDToBlock  := ^@FlashIDToBlocks.[11..0]          ' 12-bit fields for Flash
+  FlashIDValid    := ^@FlashIDValids.[0]
+  FlashBlockState := ^@FlashBlockStates.[1..0]
+
+  ' Scan all Flash blocks to rebuild tables
+  ' First pass: identify valid blocks by CRC and lifecycle
+  repeat FLASH_BLOCKS with block_address
+    flash_check_block_fix_dupe(block_address)
+
+  ' Second pass: trace file chains and set HEAD/BODY states
+  repeat FLASH_BLOCKS with block_address
+    if field[FlashBlockState][block_address] == B_TEMP
+      flash_read_block(block_address, @block_type_bits, $000, $000)
+      ifnot block_type_bits.[1]                         ' Is this a head block?
+        ifnot flash_trace_file_set_flags(block_address, true)
+          flash_trace_file_set_flags(block_address, false)
+
+  ' Third pass: cancel orphan B_TEMP blocks
+  repeat FLASH_BLOCKS with block_address
+    if field[FlashBlockState][block_address] == B_TEMP
+      flash_read_block(block_address, @signature, $000, $003)
+      field[FlashIDValid][signature.[19..8]]~
+      field[FlashBlockState][block_address] := B_FREE
+      flash_cancel_block(block_address)
+      status := E_BAD_BLOCKS_REMOVED
+
+
+PRI flash_allocate_block() : block_address | free_count, free_block_addr, free_index, next_cycle_bits
+'' Allocate a free Flash block with wear-leveling
+'' Uses random block selection to distribute writes evenly across Flash
+'' @returns block_address - allocated block address or E_DRIVE_FULL
+'' May relocate an existing block if random selection hits HEAD/BODY block
+
+  ' Count free blocks first
+  ifnot free_count := flash_blocks_free()
+    return E_DRIVE_FULL
+
+  ' Randomly pick a non-TEMP block (FREE, HEAD, or BODY)
+  repeat
+    block_address := abs getrnd() // FLASH_BLOCKS
+  until field[FlashBlockState][block_address] <> B_TEMP
+
+  ' If block is FREE, mark as TEMP and return
+  if field[FlashBlockState][block_address] == B_FREE
+    field[FlashBlockState][block_address] := B_TEMP
+    return block_address
+
+  ' Block is HEAD or BODY - must relocate it to a FREE block first
+  ' Randomly pick a FREE block to relocate to
+  free_index := abs getrnd() // free_count
+  repeat FLASH_BLOCKS with free_block_addr
+    ifnot field[FlashBlockState][free_block_addr]       ' B_FREE == 0
+      ifnot free_index--
+        quit
+
+  ' Evict: read block, advance lifecycle, write to free block, cancel original
+  flash_read_block(block_address, @tmpBlockBuffer, $000, $FFF)
+  next_cycle_bits := flash_next_active_cycle(LONG[@tmpBlockBuffer].[7..5])
+  flash_write_block(free_block_addr, @tmpBlockBuffer, next_cycle_bits)
+  flash_activate_block(free_block_addr, next_cycle_bits)
+  flash_cancel_block(block_address)
+
+  ' Update tables: moved block goes to free location, original becomes TEMP
+  field[FlashIDToBlock][LONG[@tmpBlockBuffer].[19..8]] := free_block_addr
+  field[FlashBlockState][free_block_addr] := field[FlashBlockState][block_address]
+  field[FlashBlockState][block_address] := B_TEMP
+
+
+PRI flash_free_block(block_id) | block_address
+'' Free a Flash block by canceling it
+'' @param block_id - block ID to free (0 to FLASH_BLOCKS-1)
+
+  if block_id >= 0 and block_id < FLASH_BLOCKS
+    if field[FlashIDValid][block_id]
+      block_address := field[FlashIDToBlock][block_id]
+      flash_cancel_block(block_address)
+      field[FlashBlockState][block_address] := B_FREE
+      field[FlashIDValid][block_id]~
+
+
+PRI flash_read_block(block_address, p_buffer, first_byte, last_byte)
+'' Read bytes from Flash block
+'' @param block_address - block offset in Flash (0 to FLASH_BLOCKS-1)
+'' @param p_buffer - destination buffer
+'' @param first_byte - first byte offset within block (0 to BLOCK_SIZE-1)
+'' @param last_byte - last byte offset within block (first_byte to BLOCK_SIZE-1)
+
+  ' Send read command with address: $03 + (FLASH_FIRST_BLOCK + block_address) + first_byte
+  flash_command($03 | (FLASH_FIRST_BLOCK + block_address) << 20 | first_byte << 8, 4)
+  flash_receive(p_buffer, last_byte - first_byte + 1)
+
+
+PRI flash_write_block(block_address, p_buffer, cycle_bits) | page_index
+'' Write (program) block to Flash with lifecycle bits
+'' Erases block first, then programs 16 pages of 256 bytes each
+'' @param block_address - block offset in Flash (0 to FLASH_BLOCKS-1)
+'' @param p_buffer - source buffer (4KB)
+'' @param cycle_bits - lifecycle bits (3, 5, or 6)
+
+  ' Enable write and erase 4KB block
+  flash_command($06, 1)                                 ' Write enable
+  flash_command($20 | (FLASH_FIRST_BLOCK + block_address) << 20, 4)  ' Sector erase
+
+  ' Install lifecycle bits for CRC computation, then remove
+  BYTE[p_buffer].[7..5] := cycle_bits
+  LONG[p_buffer + $FFC] := block_crc(p_buffer)          ' Compute and install CRC
+  BYTE[p_buffer].[7..5]~~                               ' Remove lifecycle (= %111), inactive until activated
+
+  flash_wait()                                          ' Wait for erase (~45ms)
+
+  ' Program 16 pages of 256 bytes each
+  repeat 16 with page_index
+    flash_command($06, 1)                               ' Write enable
+    flash_command($02 | (FLASH_FIRST_BLOCK + block_address) << 20 | page_index << 16, 4)
+    flash_send(p_buffer + page_index << 8, 256)
+    flash_wait()                                        ' Wait for program (~400us)
+
+
+PRI flash_activate_block(block_address, cycle_bits)
+'' Activate Flash block by setting lifecycle bits (atomic operation)
+'' @param block_address - block offset (0 to FLASH_BLOCKS-1)
+'' @param cycle_bits - lifecycle bits (3, 5, or 6)
+
+  flash_program_bit(block_address, cycle_bits << 5 | %00011111)
+
+
+PRI flash_cancel_block(block_address)
+'' Cancel Flash block by clearing all lifecycle bits
+'' @param block_address - block offset (0 to FLASH_BLOCKS-1)
+
+  flash_program_bit(block_address, %00011111)
+
+
+PRI flash_program_bit(block_address, bit_pattern)
+'' Program single byte (first byte with lifecycle bits) in Flash block
+'' This is the most atomic Flash operation for activation/cancellation
+'' @param block_address - block offset (0 to FLASH_BLOCKS-1)
+'' @param bit_pattern - byte value to program (bits can only go 1->0)
+
+  flash_command($06, 1)                                 ' Write enable
+  flash_command($02 | (FLASH_FIRST_BLOCK + block_address) << 20, 4)  ' Program at block start
+  flash_send(@bit_pattern, 1)
+  flash_wait()
+
+
+PRI flash_get_block_state(block_id) : state
+'' Get state of Flash block
+'' @param block_id - block ID (0 to FLASH_BLOCKS-1)
+'' @returns state - B_FREE, B_TEMP, B_HEAD, B_BODY
+
+  if block_id >= 0 and block_id < FLASH_BLOCKS
+    return field[FlashBlockState][block_id]
+  return B_FREE
+
+
+PRI flash_set_block_state(block_id, state)
+'' Set state of Flash block (in-memory only, does not write to Flash)
+'' @param block_id - block ID (0 to FLASH_BLOCKS-1)
+'' @param state - new state (B_FREE, B_TEMP, B_HEAD, B_BODY)
+
+  if block_id >= 0 and block_id < FLASH_BLOCKS
+    if state >= B_FREE and state <= B_BODY
+      field[FlashBlockState][block_id] := state
+
+
+PRI flash_blocks_free() : count | blk_addr
+'' Count free Flash blocks
+'' @returns count - number of free blocks
+
+  count := 0
+  repeat FLASH_BLOCKS with blk_addr
+    if field[FlashBlockState][blk_addr] == B_FREE
+      count++
+
+
+PRI flash_check_block_fix_dupe(block_address) | signature, cycle_bits, block_id, old_cycle, old_addr
+'' Check block CRC and lifecycle, fix duplicate IDs
+'' Used during mount to recover from power loss during block writes
+'' @param block_address - block to check
+
+  ' Read block signature (first long) and check lifecycle
+  flash_read_block(block_address, @signature, $000, $003)
+  cycle_bits := signature.[7..5]
+
+  ' Check if this is a valid active block (lifecycle 3, 5, or 6)
+  if lookdown(cycle_bits : %011, %101, %110)
+    ' Read full block and verify CRC
+    flash_read_block(block_address, @tmpBlockBuffer, $000, $FFF)
+    BYTE[@tmpBlockBuffer].[7..5] := cycle_bits          ' Restore lifecycle for CRC check
+    if LONG[@tmpBlockBuffer + $FFC] == block_crc(@tmpBlockBuffer)
+      ' Valid block - check for duplicate ID
+      block_id := signature.[19..8]
+      if field[FlashIDValid][block_id]
+        ' Duplicate ID found - keep newer (higher lifecycle)
+        old_addr := field[FlashIDToBlock][block_id]
+        flash_read_block(old_addr, @old_cycle, $000, $000)
+        old_cycle := old_cycle.[7..5]
+        ' Compare lifecycles: 3->5->6->3 (higher in sequence wins)
+        if flash_next_active_cycle(old_cycle) == cycle_bits
+          ' New block is newer - cancel old block
+          flash_cancel_block(old_addr)
+          field[FlashBlockState][old_addr] := B_FREE
+        else
+          ' Old block is newer - cancel this block
+          flash_cancel_block(block_address)
+          return
+      ' Register this block
+      field[FlashIDToBlock][block_id] := block_address
+      field[FlashIDValid][block_id]~~
+      field[FlashBlockState][block_address] := B_TEMP
+
+
+PRI flash_trace_file_set_flags(head_block_address, set_flags) : validChain | signature, next_id, block_addr
+'' Trace file chain from head block, optionally setting HEAD/BODY states
+'' @param head_block_address - starting block address
+'' @param set_flags - if true, set block states; if false, clear to B_TEMP
+'' @returns validChain - true if valid chain, false if broken
+
+  block_addr := head_block_address
+
+  repeat
+    ' Read block signature
+    flash_read_block(block_addr, @signature, $000, $003)
+
+    ' Set/clear state based on set_flags
+    if set_flags
+      if block_addr == head_block_address
+        field[FlashBlockState][block_addr] := B_HEAD
+      else
+        field[FlashBlockState][block_addr] := B_BODY
+    else
+      field[FlashBlockState][block_addr] := B_TEMP
+
+    ' Check if this is last block
+    if signature.[0] == 0                               ' Last block flag
+      return true
+
+    ' Get next block ID and verify
+    next_id := signature.[31..20]
+    ifnot field[FlashIDValid][next_id]
+      return false                                      ' Broken chain
+
+    block_addr := field[FlashIDToBlock][next_id]
+
+
+PRI flash_next_active_cycle(cycle_in) : cycle_out
+'' Calculate next Flash lifecycle (3 -> 5 -> 6 -> 3)
+'' @param cycle_in - current lifecycle
+'' @returns cycle_out - next lifecycle
+  cycle_out := (cycle_in * %001_001) >> 1 & %111
+
+
+CON ' --- RAM Block Layer ---
+
+
+PRI ram_init() : status
+'' Initialize PSRAM hardware and block management arrays
+'' @returns status - SUCCESS or error
+
+  ' Start dedicated PSRAM driver cog (handles pin init and QSPI)
+  if not psram_start_driver()
+    return E_NO_LOCK_AVAIL                              ' No cog available
+
+  ' Initialize RAM block management arrays
+  bytefill(@RAMIDToBlocks, 0, RAM_ID_TO_BLOCKS_SZ * 2)   ' Clear ID-to-block table
+  bytefill(@RAMIDValids, 0, RAM_FLAGS_SIZE)              ' Clear ID validity flags
+  bytefill(@RAMBlockStates, 0, RAM_STATES_SIZE)          ' Clear block states (all B_FREE)
+
+  ' Setup field pointers for bit-field access
+  RAMIDToBlock  := ^@RAMIDToBlocks.[12..0]               ' 13-bit fields for 8192 blocks
+  RAMIDValid    := ^@RAMIDValids.[0]                     ' 1-bit fields
+  RAMBlockState := ^@RAMBlockStates.[1..0]               ' 2-bit fields
+
+  return SUCCESS
+
+
+PRI ram_allocate_block() : block_id | blk_addr
+'' Allocate a free RAM block (sequential, no wear leveling)
+'' @returns block_id - allocated block ID or E_DRIVE_FULL
+'' RAM uses simple sequential allocation (no random selection like Flash wear-leveling)
+
+  ' Sequential search for first free block
+  repeat RAM_BLOCKS with blk_addr
+    if field[RAMBlockState][blk_addr] == B_FREE
+      ' Found free block - mark as TEMP and return
+      field[RAMBlockState][blk_addr] := B_TEMP
+      return blk_addr
+
+  ' No free blocks available
+  return E_DRIVE_FULL
+
+
+PRI ram_allocate_contiguous(block_count) : first_block_id | start_blk, blk_addr, run_length
+'' Allocate contiguous RAM blocks for hardware-accelerated access
+'' @param block_count - number of consecutive blocks needed
+'' @returns first_block_id - first block ID or E_CONTIGUOUS_FULL
+'' Searches for a run of consecutive free blocks
+
+  if block_count < 1 or block_count > RAM_BLOCKS
+    return E_BAD_FILE_LENGTH
+
+  ' Search for a run of block_count consecutive free blocks
+  start_blk := 0
+  repeat while start_blk <= RAM_BLOCKS - block_count
+    ' Check if run starting at start_blk has enough free blocks
+    run_length := 0
+    repeat block_count with blk_addr
+      if field[RAMBlockState][start_blk + blk_addr] == B_FREE
+        run_length++
+      else
+        quit
+
+    if run_length == block_count
+      ' Found contiguous space - mark all blocks as TEMP
+      repeat block_count with blk_addr
+        field[RAMBlockState][start_blk + blk_addr] := B_TEMP
+      return start_blk
+
+    ' Skip past non-free block
+    start_blk += run_length + 1
+
+  ' No contiguous space available
+  return E_CONTIGUOUS_FULL
+
+
+PRI ram_free_block(block_id)
+'' Free a RAM block
+'' @param block_id - block ID to free (0 to RAM_BLOCKS-1)
+
+  ' Validate block ID
+  if block_id >= 0 and block_id < RAM_BLOCKS
+    field[RAMBlockState][block_id] := B_FREE
+    field[RAMIDValid][block_id]~                        ' Clear ID validity flag
+
+
+PRI ram_read_block(block_address, p_buffer, first_byte, last_byte) | psram_addr, byte_count
+'' Read bytes from RAM block
+'' @param block_address - block offset in PSRAM (0 to RAM_BLOCKS-1)
+'' @param p_buffer - destination buffer
+'' @param first_byte - first byte offset within block (0 to BLOCK_SIZE-1)
+'' @param last_byte - last byte offset within block (first_byte to BLOCK_SIZE-1)
+
+  psram_addr := (block_address << BLOCK_SIZE_EXP) + first_byte
+  byte_count := last_byte - first_byte + 1
+  ' Round to long boundary for QSPI transfer
+  byte_count := (byte_count + 3) & !3
+  psram_read(psram_addr & !3, p_buffer, byte_count)
+
+
+PRI ram_write_block(block_address, p_buffer) | psram_addr
+'' Write full 4KB block to RAM
+'' @param block_address - block offset in PSRAM (0 to RAM_BLOCKS-1)
+'' @param p_buffer - source buffer (must be 4KB)
+
+  psram_addr := block_address << BLOCK_SIZE_EXP
+  psram_write(psram_addr, p_buffer, BLOCK_SIZE)
+
+
+PRI ram_get_block_state(block_id) : state
+'' Get state of RAM block
+'' @param block_id - block ID (0 to RAM_BLOCKS-1)
+'' @returns state - B_FREE, B_TEMP, B_HEAD, B_BODY
+
+  ' Validate block ID
+  if block_id >= 0 and block_id < RAM_BLOCKS
+    return field[RAMBlockState][block_id]
+  return B_FREE
+
+
+PRI ram_set_block_state(block_id, state)
+'' Set state of RAM block
+'' @param block_id - block ID (0 to RAM_BLOCKS-1)
+'' @param state - new state (B_FREE, B_TEMP, B_HEAD, B_BODY)
+
+  ' Validate block ID and state
+  if block_id >= 0 and block_id < RAM_BLOCKS
+    if state >= B_FREE and state <= B_BODY
+      field[RAMBlockState][block_id] := state
+
+
+PRI ram_blocks_free() : count | blk_addr
+'' Count free RAM blocks
+'' @returns count - number of free blocks
+
+  count := 0
+  repeat RAM_BLOCKS with blk_addr
+    if field[RAMBlockState][blk_addr] == B_FREE
+      count++
+
+
+CON ' --- CRC Operations ---
+
+
+PRI block_crc(p_block_buffer) : crc
+'' Calculate CRC for block
+'' @param p_block_buffer - pointer to 4KB block buffer
+'' @returns crc - calculated CRC
+  return getcrc(p_block_buffer, $AD0424F3 rev 31, BLOCK_SIZE - 4)
+
+
+PRI filename_crc(p_filename) : crc
+'' Calculate CRC for filename
+'' @param p_filename - pointer to filename string
+'' @returns crc - calculated 19-bit CRC
+
+  crc := getcrc(p_filename, $B5827 rev 19, strsize(p_filename))
+
+
+CON ' --- File Chain Operations ---
+
+
+PRI trace_file_blocks(head_block_address, set_state) : validChain
+'' Trace file block chain, optionally setting states
+'' @param head_block_address - starting block address
+'' @param set_state - if true, set B_HEAD/B_BODY states
+'' @returns validChain - true if valid chain
+  ' TODO: Implement (copy from flash_fs)
+  return false
+
+
+PRI count_file_bytes(head_block_address) : bytes_used, bytes_free, block_count | signature, block_address
+'' Count bytes in Flash file chain
+'' @param head_block_address - starting block address
+'' @returns bytes_used - total file size
+'' @returns bytes_free - unused bytes in last block
+'' @returns block_count - number of blocks
+
+  block_address := head_block_address
+  if block_address == NOT_VALID
+    return 0, 0, 0
+
+  repeat                                                  ' Trace blocks to count file bytes
+    flash_read_block(block_address, @signature, $000, $003)
+    block_count++
+    case signature.[1..0]
+      %00:                                                ' head/last
+        bytes_used := signature.[31..20] - $088           ' End ptr minus header
+        bytes_free := $FFC - signature.[31..20]
+        return
+      %01:                                                ' head/more
+        bytes_used := $FFC - $088                         ' Full head block data
+      %10:                                                ' body/last
+        bytes_used += signature.[31..20] - $004           ' End ptr minus signature
+        bytes_free := $FFC - signature.[31..20]
+        return
+      %11:                                                ' body/more
+        bytes_used += $FFC - $004                         ' Full body block data
+    block_address := field[FlashIDToBlock][signature.[31..20]]  ' Get next block
+
+
+PRI count_file_bytes_ram(head_block_address) : bytes_used | signature, block_address
+'' Count bytes in RAM file chain
+'' @param head_block_address - starting block address
+'' @returns bytes_used - total file size
+
+  block_address := head_block_address
+  if block_address == NOT_VALID
+    return 0
+
+  repeat                                                  ' Trace blocks to count file bytes
+    ram_read_block(block_address, @signature, $000, $003)
+    case signature.[1..0]
+      %00:                                                ' head/last
+        bytes_used := signature.[31..20] - $088           ' End ptr minus header
+        return
+      %01:                                                ' head/more
+        bytes_used := $FFC - $088                         ' Full head block data
+      %10:                                                ' body/last
+        bytes_used += signature.[31..20] - $004           ' End ptr minus signature
+        return
+      %11:                                                ' body/more
+        bytes_used += $FFC - $004                         ' Full body block data
+    block_address := field[RAMIDToBlock][signature.[31..20]]  ' Get next block
+
+
+PRI count_file_bytes_device(device, head_block_id) : bytes_used | block_address
+'' Count bytes in file chain for any device
+'' @param device - DRIVE_F or DRIVE_R
+'' @param head_block_id - starting block ID
+'' @returns bytes_used - total file size
+
+  if device == DRIVE_F
+    if head_block_id <> NOT_VALID and field[FlashIDValid][head_block_id]
+      block_address := field[FlashIDToBlock][head_block_id]
+      bytes_used, _, _ := count_file_bytes(block_address)
+  else
+    if head_block_id <> NOT_VALID and field[RAMIDValid][head_block_id]
+      block_address := field[RAMIDToBlock][head_block_id]
+      bytes_used := count_file_bytes_ram(block_address)
+
+
+PRI froncate_file(device, head_block_id, limit_in_bytes) | size_in_bytes, block_address, signature, bytes_to_remove, blocks_to_remove, next_block_id
+'' Remove leading block(s) from file that exceeds circular size limit
+'' @param device - DRIVE_F or DRIVE_R
+'' @param head_block_id - block ID of file
+'' @param limit_in_bytes - maximum file size in bytes
+'' NOTE: This is a simplified block-level froncation (removes whole blocks)
+
+  ' Get current file size
+  size_in_bytes := count_file_bytes_device(device, head_block_id)
+
+  ' If file is within limit, nothing to do
+  if size_in_bytes <= limit_in_bytes
+    return
+
+  ' Calculate bytes to remove
+  bytes_to_remove := size_in_bytes - limit_in_bytes
+
+  ' Walk chain removing leading blocks until within limit
+  if device == DRIVE_F
+    block_address := field[FlashIDToBlock][head_block_id]
+    repeat while bytes_to_remove > 0
+      flash_read_block(block_address, @signature, $000, $003)
+      ' Calculate bytes in this block
+      case signature.[1..0]
+        %00, %01:                                          ' Head block
+          bytes_to_remove -= (signature.[0] ? $FFC - $088 : signature.[31..20] - $088)
+        %10, %11:                                          ' Body block
+          bytes_to_remove -= (signature.[0] ? $FFC - $004 : signature.[31..20] - $004)
+
+      ' Get next block before freeing this one
+      if signature.[0]
+        next_block_id := signature.[31..20]
+      else
+        return                                             ' Last block, can't remove more
+
+      ' Free current block
+      flash_free_block(head_block_id)
+      head_block_id := next_block_id
+      block_address := field[FlashIDToBlock][head_block_id]
+
+  else ' RAM device
+    block_address := field[RAMIDToBlock][head_block_id]
+    repeat while bytes_to_remove > 0
+      ram_read_block(block_address, @signature, $000, $003)
+      ' Calculate bytes in this block
+      case signature.[1..0]
+        %00, %01:                                          ' Head block
+          bytes_to_remove -= (signature.[0] ? $FFC - $088 : signature.[31..20] - $088)
+        %10, %11:                                          ' Body block
+          bytes_to_remove -= (signature.[0] ? $FFC - $004 : signature.[31..20] - $004)
+
+      ' Get next block before freeing this one
+      if signature.[0]
+        next_block_id := signature.[31..20]
+      else
+        return                                             ' Last block, can't remove more
+
+      ' Free current block
+      ram_free_block(head_block_id)
+      head_block_id := next_block_id
+      block_address := field[RAMIDToBlock][head_block_id]
+
+
+PRI delete_chain(head_block_id, keep_head)
+'' Delete file block chain
+'' @param head_block_id - starting block ID
+'' @param keep_head - if true, keep head block valid
+  ' TODO: Implement
+
+
+CON ' --- Internal File Operations ---
+
+
+PRI get_file_head_signature(device, p_filename) : signature
+'' Find file and return head block signature
+'' @param device - DRIVE_F or DRIVE_R
+'' @param p_filename - filename to find
+'' @returns signature - block signature or 0 if not found
+  ' TODO: Implement
+  return 0
+
+
+PRI is_file_open(p_filename, mode) : isOpen | device, p_name
+'' Check if file is already open
+'' @param p_filename - filename with drive prefix
+'' @param mode - mode to check
+'' @returns isOpen - true if file is open in mode
+
+  device, p_name := parse_drive_letter(p_filename)
+  return is_file_open_device(device, p_name, mode)
+
+
+PRI is_file_open_device(device, p_name, mode) : isOpen | handle, name_crc
+'' Check if file is already open on specified device
+'' @param device - DRIVE_F or DRIVE_R
+'' @param p_name - pointer to filename (without drive prefix)
+'' @param mode - mode to check
+'' @returns isOpen - true if file is open in mode
+
+  name_crc := filename_crc(p_name)
+
+  repeat MAX_FILES_OPEN with handle
+    if hStatus[handle] & mode                             ' Handle is in matching mode
+      if hDevice[handle] == device                        ' Same device
+        ' Check if filename matches (compare CRC in head block)
+        if hHeadBlockID[handle] <> NOT_VALID
+          ' Get stored filename CRC from the file's head block signature
+          if device == DRIVE_F
+            if field[FlashIDValid][hHeadBlockID[handle]]
+              if get_filename_crc_from_handle(handle) == name_crc
+                return true
+          else
+            if field[RAMIDValid][hHeadBlockID[handle]]
+              if get_filename_crc_from_handle(handle) == name_crc
+                return true
+
+
+PRI get_filename_crc_from_handle(handle) : name_crc | signature
+'' Get filename CRC from a handle's head block
+'' @param handle - file handle
+'' @returns name_crc - 19-bit filename CRC
+
+  if hDevice[handle] == DRIVE_F
+    flash_read_block(field[FlashIDToBlock][hHeadBlockID[handle]], @signature, $004, $007)
+  else
+    ram_read_block(field[RAMIDToBlock][hHeadBlockID[handle]], @signature, $004, $007)
+  return signature.[31..12]
+
+
+PRI exists_no_lock(device, p_name) : found
+'' Check if file exists without acquiring lock
+'' @param device - DRIVE_F or DRIVE_R
+'' @param p_name - pointer to filename (without drive prefix)
+'' @returns found - true if file exists
+
+  return get_file_head_signature_device(device, p_name) <> 0
+
+
+PRI get_file_head_signature_device(device, p_name) : signature | name_crc, block_id, block_address, block_signature
+'' Find file and return head block signature
+'' @param device - DRIVE_F or DRIVE_R
+'' @param p_name - filename to find (without drive prefix)
+'' @returns signature - block signature or 0 if not found
+
+  name_crc := filename_crc(p_name)
+
+  if device == DRIVE_F
+    ' Search Flash blocks for matching filename CRC
+    repeat FLASH_BLOCKS with block_id
+      if field[FlashIDValid][block_id]
+        if field[FlashBlockState][field[FlashIDToBlock][block_id]] == B_HEAD
+          block_address := field[FlashIDToBlock][block_id]
+          flash_read_block(block_address, @block_signature, $000, $007)
+          if LONG[@block_signature + 4].[31..12] == name_crc
+            ' Verify filename matches (CRC collision check)
+            flash_read_block(block_address, @tmpBlockBuffer, $008, $087)
+            if strcomp(@tmpBlockBuffer, p_name)
+              ' Read full signature
+              flash_read_block(block_address, @signature, $000, $003)
+              return signature
+  else
+    ' Search RAM blocks for matching filename CRC
+    repeat RAM_BLOCKS with block_id
+      if field[RAMIDValid][block_id]
+        if field[RAMBlockState][field[RAMIDToBlock][block_id]] == B_HEAD
+          block_address := field[RAMIDToBlock][block_id]
+          ram_read_block(block_address, @block_signature, $000, $007)
+          if LONG[@block_signature + 4].[31..12] == name_crc
+            ' Verify filename matches (CRC collision check)
+            ram_read_block(block_address, @tmpBlockBuffer, $008, $087)
+            if strcomp(@tmpBlockBuffer, p_name)
+              ' Read full signature
+              ram_read_block(block_address, @signature, $000, $003)
+              return signature
+
+
+PRI delete_chain_from_id(device, block_id, keep_head) | block_address, signature, next_id
+'' Delete file block chain
+'' @param device - DRIVE_F or DRIVE_R
+'' @param block_id - starting block ID
+'' @param keep_head - if true, keep head block valid
+
+  if device == DRIVE_F
+    ' Get block address
+    block_address := field[FlashIDToBlock][block_id]
+
+    repeat
+      ' Read block signature
+      flash_read_block(block_address, @signature, $000, $003)
+
+      ' Check if this is last block (bit 0 = 0 means last)
+      if signature.[0] == 0
+        ' Last block - free it
+        flash_cancel_block(block_address)
+        field[FlashBlockState][block_address] := B_FREE
+        field[FlashIDValid][block_id]~
+        quit
+
+      ' Get next block ID
+      next_id := signature.[31..20]
+
+      ' Free current block unless it's head and we're keeping it
+      if not keep_head or block_address <> field[FlashIDToBlock][block_id]
+        flash_cancel_block(block_address)
+        field[FlashBlockState][block_address] := B_FREE
+        field[FlashIDValid][block_id]~
+
+      ' Move to next block
+      block_id := next_id
+      block_address := field[FlashIDToBlock][next_id]
+
+  else
+    ' RAM deletion is simpler - just update state arrays
+    block_address := field[RAMIDToBlock][block_id]
+
+    repeat
+      ' Read block signature
+      ram_read_block(block_address, @signature, $000, $003)
+
+      ' Check if this is last block
+      if signature.[0] == 0
+        ' Last block - free it
+        field[RAMBlockState][block_address] := B_FREE
+        field[RAMIDValid][block_id]~
+        quit
+
+      ' Get next block ID
+      next_id := signature.[31..20]
+
+      ' Free current block unless it's head and we're keeping it
+      if not keep_head or block_address <> field[RAMIDToBlock][block_id]
+        field[RAMBlockState][block_address] := B_FREE
+        field[RAMIDValid][block_id]~
+
+      ' Move to next block
+      block_id := next_id
+      block_address := field[RAMIDToBlock][next_id]
+
+
+PRI close_no_lock(handle) : status | device, p_buffer, signature, block_address
+'' Close file without acquiring locks (used during unmount)
+'' @param handle - file handle to close
+'' @returns status - SUCCESS or error
+
+  ' Validate handle
+  if handle < 0 or handle >= MAX_FILES_OPEN
+    return E_BAD_HANDLE
+  ifnot hStatus[handle]
+    return E_BAD_HANDLE
+
+  device := hDevice[handle]
+  p_buffer := @BYTE[@hBlockBuff][handle * BLOCK_SIZE]
+
+  ' Flush dirty buffer if modified
+  if hModified[handle]
+    ' Update end pointer in block signature
+    signature := LONG[p_buffer]
+    if signature.[1] == 0                                  ' Head block
+      ' Store end pointer in bits [31..20] of signature
+      LONG[p_buffer].[31..20] := hEndPtr[handle]
+    else                                                   ' Body block
+      ' Store end pointer in bits [31..20] of signature
+      LONG[p_buffer].[31..20] := hEndPtr[handle]
+
+    ' Update CRC
+    LONG[p_buffer + $FFC] := block_crc(p_buffer)
+
+    if device == DRIVE_F
+      block_address := field[FlashIDToBlock][hChainBlockID[handle]]
+      flash_write_block(block_address, p_buffer, BYTE[p_buffer].[7..5])
+      flash_activate_block(block_address, BYTE[p_buffer].[7..5])
+    else
+      block_address := field[RAMIDToBlock][hChainBlockID[handle]]
+      ram_write_block(block_address, p_buffer)
+    hModified[handle] := false
+
+  ' If circular file, enforce size limit
+  if hCircularLength[handle]
+    froncate_file(device, hHeadBlockID[handle], hCircularLength[handle])
+
+  ' Free the handle
+  free_handle(handle)
+  return SUCCESS
+
+
+PRI build_head_block(p_buffer, p_filename, circular_length, block_id) | name_crc
+'' Build head block in buffer
+'' @param p_buffer - destination buffer
+'' @param p_filename - filename to embed
+'' @param circular_length - circular length or 0
+'' @param block_id - block ID for this head block
+
+  ' Clear buffer
+  bytefill(p_buffer, $FF, BLOCK_SIZE)
+
+  ' Build signature (first long): lifecycle_bits[7:5], block_id[19:8], is_body[1], is_last[0]
+  ' Head block: is_body=0, is_last=0 initially (will be updated as file grows)
+  LONG[p_buffer] := block_id << 8
+
+  ' Install filename CRC at offset $004
+  name_crc := filename_crc(p_filename)
+  LONG[p_buffer + $004].[31..12] := name_crc
+
+  ' Copy filename at offset $008
+  bytefill(p_buffer + $008, $E5, FILENAME_SIZE)           ' Fill with pattern
+  strcopy(p_buffer + $008, p_filename, FILENAME_SIZE - 1)
+
+  ' If circular file, store max length
+  if circular_length
+    LONG[p_buffer + $084] := circular_length
+
+
+PRI finish_open_read(device, p_name, circular_length) : handle | signature, block_id, block_address
+'' Finish opening file for read
+'' @param device - DRIVE_F or DRIVE_R
+'' @param p_name - filename (without drive prefix)
+'' @param circular_length - circular buffer length (0 for normal file)
+'' @returns handle - allocated handle or error
+
+  ' Get file head signature
+  signature := get_file_head_signature_device(device, p_name)
+  if signature == 0
+    if device == DRIVE_F
+      lockrel(flashLock)
+    else
+      lockrel(ramLock)
+    return E_FILE_NOT_FOUND
+
+  block_id := signature.[19..8]
+
+  ' Allocate handle
+  handle := allocate_handle(device)
+  if handle < 0
+    if device == DRIVE_F
+      lockrel(flashLock)
+    else
+      lockrel(ramLock)
+    return handle
+
+  ' Setup handle for reading
+  hStatus[handle] := H_READ
+  hHeadBlockID[handle] := block_id
+  hCircularLength[handle] := circular_length
+  hEndPtr[handle] := ADDR_HEAD_DATA
+  hSeekPtr[handle] := NOT_ENABLED
+  hSeekFileOffset[handle] := 0
+  hModified[handle] := false
+
+  ' Load first block into buffer
+  if device == DRIVE_F
+    block_address := field[FlashIDToBlock][block_id]
+    flash_read_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+  else
+    block_address := field[RAMIDToBlock][block_id]
+    ram_read_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+
+  ' Copy filename to handle's filename buffer
+  strcopy(@BYTE[@hFilename][handle * FILENAME_SIZE], p_name, FILENAME_SIZE - 1)
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PRI finish_open_write(device, p_name, circular_length) : handle | block_id, block_address, signature
+'' Finish opening file for write (creates new file)
+'' @param device - DRIVE_F or DRIVE_R
+'' @param p_name - filename (without drive prefix)
+'' @param circular_length - circular buffer length (0 for normal file)
+'' @returns handle - allocated handle or error
+
+  ' Delete existing file if it exists
+  if exists_no_lock(device, p_name)
+    signature := get_file_head_signature_device(device, p_name)
+    delete_chain_from_id(device, signature.[19..8], false)
+
+  ' Allocate a block
+  if device == DRIVE_F
+    block_address := flash_allocate_block()
+    if block_address < 0
+      lockrel(flashLock)
+      return E_DRIVE_FULL
+    block_id := block_address                             ' For Flash, block_address is also block_id during allocation
+  else
+    block_id := ram_allocate_block()
+    if block_id < 0
+      lockrel(ramLock)
+      return E_DRIVE_FULL
+    block_address := block_id
+
+  ' Allocate handle
+  handle := allocate_handle(device)
+  if handle < 0
+    if device == DRIVE_F
+      flash_free_block(block_id)
+      lockrel(flashLock)
+    else
+      ram_free_block(block_id)
+      lockrel(ramLock)
+    return handle
+
+  ' Setup handle for writing
+  hStatus[handle] := H_WRITE
+  hHeadBlockID[handle] := block_id
+  hChainBlockID[handle] := block_id
+  hChainBlockAddr[handle] := block_address
+  hCircularLength[handle] := circular_length
+  hEndPtr[handle] := ADDR_HEAD_DATA
+  hSeekPtr[handle] := NOT_ENABLED
+  hSeekFileOffset[handle] := 0
+  hModified[handle] := true
+
+  ' Build head block in buffer
+  build_head_block(@BYTE[@hBlockBuff][handle * BLOCK_SIZE], p_name, circular_length, block_id)
+
+  ' Copy filename to handle's filename buffer
+  strcopy(@BYTE[@hFilename][handle * FILENAME_SIZE], p_name, FILENAME_SIZE - 1)
+
+  ' Update block state
+  if device == DRIVE_F
+    field[FlashBlockState][block_address] := B_HEAD
+    field[FlashIDValid][block_id]~~
+    field[FlashIDToBlock][block_id] := block_address
+  else
+    field[RAMBlockState][block_address] := B_HEAD
+    field[RAMIDValid][block_id]~~
+    field[RAMIDToBlock][block_id] := block_address
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PRI finish_open_append(device, p_name, circular_length) : handle | signature, block_id
+'' Finish opening file for append
+'' @param device - DRIVE_F or DRIVE_R
+'' @param p_name - filename (without drive prefix)
+'' @param circular_length - circular buffer length (0 for normal file)
+'' @returns handle - allocated handle or error
+
+  ' Get file head signature
+  signature := get_file_head_signature_device(device, p_name)
+  if signature == 0
+    if device == DRIVE_F
+      lockrel(flashLock)
+    else
+      lockrel(ramLock)
+    return E_FILE_NOT_FOUND
+
+  block_id := signature.[19..8]
+
+  ' Allocate handle
+  handle := allocate_handle(device)
+  if handle < 0
+    if device == DRIVE_F
+      lockrel(flashLock)
+    else
+      lockrel(ramLock)
+    return handle
+
+  ' Setup handle for appending
+  hStatus[handle] := H_APPEND
+  hHeadBlockID[handle] := block_id
+  hCircularLength[handle] := circular_length
+  hModified[handle] := false
+
+  ' Find end of file and position there
+  position_to_end(handle)
+
+  ' Copy filename to handle's filename buffer
+  strcopy(@BYTE[@hFilename][handle * FILENAME_SIZE], p_name, FILENAME_SIZE - 1)
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PRI finish_open_readwrite(device, p_name) : handle | signature, block_id, block_address
+'' Finish opening file for read/write (modify in place)
+'' @param device - DRIVE_F or DRIVE_R
+'' @param p_name - filename (without drive prefix)
+'' @returns handle - allocated handle or error
+
+  ' Get file head signature
+  signature := get_file_head_signature_device(device, p_name)
+  if signature == 0
+    if device == DRIVE_F
+      lockrel(flashLock)
+    else
+      lockrel(ramLock)
+    return E_FILE_NOT_FOUND
+
+  block_id := signature.[19..8]
+
+  ' Allocate handle
+  handle := allocate_handle(device)
+  if handle < 0
+    if device == DRIVE_F
+      lockrel(flashLock)
+    else
+      lockrel(ramLock)
+    return handle
+
+  ' Setup handle for read/write
+  hStatus[handle] := H_READWRITE
+  hHeadBlockID[handle] := block_id
+  hCircularLength[handle] := 0
+  hEndPtr[handle] := ADDR_HEAD_DATA
+  hSeekPtr[handle] := ADDR_HEAD_DATA
+  hSeekFileOffset[handle] := 0
+  hModified[handle] := false
+
+  ' Load first block into buffer
+  if device == DRIVE_F
+    block_address := field[FlashIDToBlock][block_id]
+    flash_read_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+  else
+    block_address := field[RAMIDToBlock][block_id]
+    ram_read_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+
+  ' Copy filename to handle's filename buffer
+  strcopy(@BYTE[@hFilename][handle * FILENAME_SIZE], p_name, FILENAME_SIZE - 1)
+
+  ' Release lock
+  if device == DRIVE_F
+    lockrel(flashLock)
+  else
+    lockrel(ramLock)
+
+
+PRI position_to_end(handle) | device, block_id, block_address, signature
+'' Position file handle to end of file
+'' @param handle - file handle
+
+  device := hDevice[handle]
+  block_id := hHeadBlockID[handle]
+
+  ' Walk chain to find last block
+  repeat
+    if device == DRIVE_F
+      block_address := field[FlashIDToBlock][block_id]
+      flash_read_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+    else
+      block_address := field[RAMIDToBlock][block_id]
+      ram_read_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+
+    signature := LONG[@BYTE[@hBlockBuff][handle * BLOCK_SIZE]]
+
+    ' Check if this is last block
+    if signature.[0] == 0
+      quit
+
+    ' Move to next block
+    block_id := signature.[31..20]
+
+  hChainBlockID[handle] := block_id
+  hChainBlockAddr[handle] := block_address
+
+  ' Calculate end pointer from signature
+  ' End pointer is stored in bits [31..20] of signature (offset 0) for last blocks
+  hEndPtr[handle] := signature.[31..20]
+  if hEndPtr[handle] == 0
+    hEndPtr[handle] := ADDR_HEAD_DATA                     ' Default to start of data area
+
+
+PRI start_modify(handle, new_mode, head_block_id, end_position, reload_block)
+'' Start or restart modify operation
+'' @param handle - file handle
+'' @param new_mode - new handle mode
+'' @param head_block_id - head block ID
+'' @param end_position - position to start at ($FFFFFF for end)
+'' @param reload_block - whether to reload block buffer
+
+  hStatus[handle] := new_mode
+  hHeadBlockID[handle] := head_block_id
+  hModified[handle] := false
+
+  if end_position == $FFFFFF
+    position_to_end(handle)
+  elseif reload_block
+    ' Reload head block
+    if hDevice[handle] == DRIVE_F
+      flash_read_block(field[FlashIDToBlock][head_block_id], @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+    else
+      ram_read_block(field[RAMIDToBlock][head_block_id], @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+    hEndPtr[handle] := end_position
+
+
+PRI rewrite_block(handle) | device, block_address
+'' Rewrite modified block to storage
+'' @param handle - file handle
+
+  device := hDevice[handle]
+
+  if device == DRIVE_F
+    ' Flash requires erase-program cycle
+    block_address := field[FlashIDToBlock][hChainBlockID[handle]]
+    ' TODO: Implement Flash block rewrite with wear-leveling
+  else
+    ' RAM can write directly
+    block_address := field[RAMIDToBlock][hChainBlockID[handle]]
+    ram_write_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE])
+
+  hModified[handle] := false
+
+
+PRI read_byte_internal(handle) : byte_value | device, p_buffer, signature, next_id, data_offset, end_ptr, is_head
+'' Read single byte from file (internal, lock must be held)
+'' @param handle - file handle
+'' @returns byte_value - byte read or negative error code
+
+  device := hDevice[handle]
+  p_buffer := @BYTE[@hBlockBuff][handle * BLOCK_SIZE]
+
+  ' Get current block signature
+  signature := LONG[p_buffer]
+  is_head := not signature.[1]                            ' Bit 1 = 0 for head block
+
+  ' Determine data offset based on block type
+  if is_head
+    data_offset := ADDR_HEAD_DATA
+  else
+    data_offset := ADDR_BODY_DATA
+
+  ' Get end pointer for this block
+  ' For last block (bit[0]=0): end pointer is in bits[31..20] of signature
+  ' For linked blocks (bit[0]=1): block is full, use max offset
+  if signature.[0] == 0                                   ' Last block
+    end_ptr := signature.[31..20]
+  elseif is_head
+    end_ptr := $FFC                                       ' Full head block
+  else
+    end_ptr := $FFC                                       ' Full body block
+
+  ' Check if we're at end of block
+  if hEndPtr[handle] >= end_ptr
+    ' Check if this is the last block
+    if signature.[0] == 0                                 ' Bit 0 = 0 means last block
+      return E_END_OF_FILE
+
+    ' Move to next block
+    next_id := signature.[31..20]
+
+    if device == DRIVE_F
+      if not field[FlashIDValid][next_id]
+        return E_END_OF_FILE
+      flash_read_block(field[FlashIDToBlock][next_id], p_buffer, $000, $FFF)
+    else
+      if not field[RAMIDValid][next_id]
+        return E_END_OF_FILE
+      ram_read_block(field[RAMIDToBlock][next_id], p_buffer, $000, $FFF)
+
+    hChainBlockID[handle] := next_id
+    hEndPtr[handle] := ADDR_BODY_DATA                     ' Body blocks start at offset 4
+    data_offset := ADDR_BODY_DATA
+
+  ' Read the byte
+  byte_value := BYTE[p_buffer + hEndPtr[handle]]
+  hEndPtr[handle]++
+  hSeekFileOffset[handle]++
+
+
+PRI count_file_bytes_internal(handle) : total_bytes | device, block_id, block_address, signature, end_ptr, bytes_in_block, is_head
+'' Count bytes in file (internal, lock must be held)
+'' @param handle - file handle
+'' @returns total_bytes - total bytes in file
+
+  device := hDevice[handle]
+  block_id := hHeadBlockID[handle]
+  total_bytes := 0
+
+  repeat
+    ' Read block signature
+    if device == DRIVE_F
+      block_address := field[FlashIDToBlock][block_id]
+      flash_read_block(block_address, @tmpBlockBuffer, $000, $007)
+    else
+      block_address := field[RAMIDToBlock][block_id]
+      ram_read_block(block_address, @tmpBlockBuffer, $000, $007)
+
+    signature := LONG[@tmpBlockBuffer]
+    is_head := not signature.[1]
+
+    ' Get end pointer (bytes used in this block)
+    ' For last block (bit[0]=0): end pointer is in bits[31..20] of signature
+    ' For linked blocks (bit[0]=1): block is full
+    if signature.[0] == 0                                 ' Last block
+      end_ptr := signature.[31..20]
+    else
+      end_ptr := $FFC                                     ' Full block
+
+    if is_head
+      bytes_in_block := end_ptr - ADDR_HEAD_DATA
+    else
+      bytes_in_block := end_ptr - ADDR_BODY_DATA
+
+    if bytes_in_block > 0
+      total_bytes += bytes_in_block
+
+    ' Check if last block
+    if signature.[0] == 0
+      quit
+
+    ' Move to next block
+    block_id := signature.[31..20]
+
+
+PRI seek_to_position(handle, target_position) | device, block_id, block_address, signature, current_position, data_offset, bytes_in_block, is_head, end_ptr
+'' Seek to specific byte position in file (internal, lock must be held)
+'' @param handle - file handle
+'' @param target_position - byte offset from start of file
+
+  device := hDevice[handle]
+  block_id := hHeadBlockID[handle]
+  current_position := 0
+
+  ' Walk chain to find correct block
+  repeat
+    ' Read block
+    if device == DRIVE_F
+      block_address := field[FlashIDToBlock][block_id]
+      flash_read_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+    else
+      block_address := field[RAMIDToBlock][block_id]
+      ram_read_block(block_address, @BYTE[@hBlockBuff][handle * BLOCK_SIZE], $000, $FFF)
+
+    signature := LONG[@BYTE[@hBlockBuff][handle * BLOCK_SIZE]]
+    is_head := not signature.[1]
+
+    ' Determine data area and end pointer
+    if is_head
+      data_offset := ADDR_HEAD_DATA
+    else
+      data_offset := ADDR_BODY_DATA
+
+    ' Get end pointer for this block
+    ' For last block (bit[0]=0): end pointer is in bits[31..20] of signature
+    ' For linked blocks (bit[0]=1): block is full
+    if signature.[0] == 0                                 ' Last block
+      end_ptr := signature.[31..20]
+    else
+      end_ptr := $FFC                                     ' Full block
+
+    bytes_in_block := end_ptr - data_offset
+
+    ' Check if target is in this block
+    if current_position + bytes_in_block > target_position
+      ' Target is in this block
+      hChainBlockID[handle] := block_id
+      hEndPtr[handle] := data_offset + (target_position - current_position)
+      return
+
+    ' Move to next block
+    current_position += bytes_in_block
+
+    if signature.[0] == 0                                 ' Last block
+      ' Position at end of file
+      hChainBlockID[handle] := block_id
+      hEndPtr[handle] := end_ptr
+      return
+
+    block_id := signature.[31..20]
+
+
+PRI write_byte_internal(handle, byte_value) : status | device, p_buffer, signature, is_head, max_offset, new_block_id
+'' Write single byte to file (internal, lock must be held)
+'' @param handle - file handle
+'' @param byte_value - byte to write
+'' @returns status - SUCCESS or error code
+
+  device := hDevice[handle]
+  p_buffer := @BYTE[@hBlockBuff][handle * BLOCK_SIZE]
+
+  ' Get current block signature
+  signature := LONG[p_buffer]
+  is_head := not signature.[1]
+
+  ' Determine max offset for this block type
+  if is_head
+    max_offset := BLOCK_SIZE - 4                          ' Leave room for CRC
+  else
+    max_offset := BLOCK_SIZE - 4                          ' Leave room for CRC
+
+  ' Check if we need a new block
+  if hEndPtr[handle] >= max_offset
+    ' Allocate new block first (need ID for linking)
+    new_block_id := allocate_chain_block(handle)
+    if new_block_id < 0
+      return E_DRIVE_FULL
+
+    ' Link current block to new block (updates buffer)
+    link_chain_block(handle, new_block_id)
+
+    ' Now flush current block WITH the link to next block
+    status := flush_current_block(handle)
+    if status < 0
+      return status
+
+    ' Setup new block
+    setup_new_body_block(handle, new_block_id)
+    p_buffer := @BYTE[@hBlockBuff][handle * BLOCK_SIZE]
+    hEndPtr[handle] := ADDR_BODY_DATA
+
+  ' Write the byte
+  BYTE[p_buffer + hEndPtr[handle]] := byte_value
+  hEndPtr[handle]++
+  hModified[handle] := true
+
+  return SUCCESS
+
+
+PRI flush_current_block(handle) : status | device, p_buffer, signature, is_head, block_address
+'' Flush current block buffer to storage (internal)
+'' @param handle - file handle
+'' @returns status - SUCCESS or error code
+
+  device := hDevice[handle]
+  p_buffer := @BYTE[@hBlockBuff][handle * BLOCK_SIZE]
+  signature := LONG[p_buffer]
+
+  ' Update end pointer only for LAST block in chain
+  ' End pointer stored in bits[31..20] of signature (offset 0)
+  ' Do NOT modify offset 4 - that contains the filename CRC!
+  if signature.[0] == 0                                   ' Is last block?
+    LONG[p_buffer].[31..20] := hEndPtr[handle]
+
+  ' Compute and install CRC
+  LONG[p_buffer + $FFC] := block_crc(p_buffer)
+
+  ' Write block
+  if device == DRIVE_F
+    block_address := field[FlashIDToBlock][hChainBlockID[handle]]
+    ' For Flash, need full erase-program cycle with lifecycle
+    flash_write_block(block_address, p_buffer, BYTE[p_buffer].[7..5])
+    flash_activate_block(block_address, BYTE[p_buffer].[7..5])
+  else
+    block_address := field[RAMIDToBlock][hChainBlockID[handle]]
+    ram_write_block(block_address, p_buffer)
+
+  hModified[handle] := false
+  return SUCCESS
+
+
+PRI allocate_chain_block(handle) : new_block_id | device
+'' Allocate a new block for file chain (internal)
+'' @param handle - file handle
+'' @returns new_block_id - block ID or error code
+
+  device := hDevice[handle]
+
+  if device == DRIVE_F
+    new_block_id := flash_allocate_block()
+  else
+    new_block_id := ram_allocate_block()
+
+
+PRI link_chain_block(handle, new_block_id) | device, p_buffer, signature
+'' Link current block to new block in chain (internal)
+'' @param handle - file handle
+'' @param new_block_id - ID of new block to link to
+
+  device := hDevice[handle]
+  p_buffer := @BYTE[@hBlockBuff][handle * BLOCK_SIZE]
+
+  ' Update signature to link to new block
+  ' Bits [31..20] = next block ID
+  ' Bit [0] = 1 means not last block
+  signature := LONG[p_buffer]
+  signature.[31..20] := new_block_id
+  signature.[0] := 1                                      ' Not last block anymore
+  LONG[p_buffer] := signature
+
+
+PRI setup_new_body_block(handle, block_id) | device, p_buffer
+'' Setup new body block in buffer (internal)
+'' @param handle - file handle
+'' @param block_id - block ID for new block
+
+  device := hDevice[handle]
+  p_buffer := @BYTE[@hBlockBuff][handle * BLOCK_SIZE]
+
+  ' Clear buffer
+  bytefill(p_buffer, $FF, BLOCK_SIZE)
+
+  ' Setup signature for body block
+  ' Bit [1] = 1 for body block
+  ' Bit [0] = 0 for last block (initially)
+  ' Bits [19..8] = end pointer (will be updated on write)
+  LONG[p_buffer] := block_id << 8 | %10                   ' Body block, last block
+
+  ' Update handle state
+  hChainBlockID[handle] := block_id
+
+  ' Update block state
+  if device == DRIVE_F
+    field[FlashBlockState][block_id] := B_BODY
+    field[FlashIDValid][block_id]~~
+    field[FlashIDToBlock][block_id] := block_id
+  else
+    field[RAMBlockState][block_id] := B_BODY
+    field[RAMIDValid][block_id]~~
+    field[RAMIDToBlock][block_id] := block_id
+
+
+CON ' ==================== FLASH SPI DRIVER (INLINE PASM) ====================
+
+
+PRI flash_command(command, count)
+'' Send command to Flash chip via SPI
+'' @param command - command with optional address
+'' @param count - bytes to send (1-4)
+
+  org
+              fltl      #SF_MISO                        ' DO input
+
+              fltl      #SF_SCLK                        ' Reset CK smart pin
+              wrpin     ##%001000000_01_00101_0, #SF_SCLK ' Transition output, inverted (SPI mode 3)
+              wrpin     ##%001000000_00_00000_0, #SF_CS ' CS mode
+              wxpin     #4, #SF_SCLK                    ' 4 clocks per transition
+
+              drvl      #SF_CS                          ' CS high (deselect)
+              waitx     #14                             ' CS deselect time (50ns at 350MHz)
+              drvh      #SF_CS                          ' CS low (select)
+
+              movbyts   command, #%%1230                ' Reverse address bytes for sending
+  end
+
+  flash_send(@command, count)
+
+
+PRI flash_send(p_buffer, count) | tx_byte
+'' Send bytes to Flash chip via SPI
+'' @param p_buffer - source buffer
+'' @param count - bytes to send
+
+  org
+              rdfast    #0, p_buffer                    ' Start fast read from hub
+
+.byte         rfbyte    tx_byte                         ' Read byte to send
+              shl       tx_byte, #24 + 1        wc      ' MSB-justify and get D7 into c
+
+              rep       @.r, #1                         ' Protect from interrupts
+              fltl      #SF_SCLK                        ' Reset smart pin CK
+              drvl      #SF_SCLK                        ' Start smart pin CK
+              drvc      #SF_MOSI                        ' Output D7
+              wypin     #16, #SF_SCLK                   ' Begin 16 clock transitions
+              rep       @.r, #7                         ' Repeat for D6..D0
+              shl       tx_byte, #1             wc      ' Get data bit
+              drvc      #SF_MOSI                        ' Output data bit
+              waitx     #2                              ' Delay (8 clocks/bit)
+.r
+              djnz      count, #.byte                   ' Loop for all bytes
+
+              drvl      #SF_MOSI                        ' DI low
+  end
+
+
+PRI flash_receive(p_buffer, count) | rx_byte
+'' Receive bytes from Flash chip via SPI
+'' @param p_buffer - destination buffer
+'' @param count - bytes to receive
+
+  org
+              wrfast    #0, p_buffer                    ' Start fast write to hub
+
+.byte         rep       @.r, #1                         ' Protect from interrupts
+              fltl      #SF_SCLK                        ' Reset smart pin CK
+              drvl      #SF_SCLK                        ' Start smart pin CK
+              wypin     #16, #SF_SCLK                   ' Begin 16 clock transitions
+              waitx     #7                              ' Align to 2nd clock fall
+              rep       @.r, #8                         ' Repeat for 8 bits
+              waitx     #2                              ' Delay (8 clocks/bit)
+              testp     #SF_MISO                wc      ' Input data bit
+              rcl       rx_byte, #1                     ' Save data bit
+.r
+              wfbyte    rx_byte                         ' Write received byte
+
+              djnz      count, #.byte                   ' Loop for all bytes
+
+              drvl      #SF_CS                          ' CS high (deselect)
+              fltl      #SF_SCLK                        ' Reset smart pin
+  end
+
+
+PRI flash_wait() | status_bits
+'' Wait for Flash chip to complete operation
+
+  repeat
+    flash_command($05, 1)                               ' Read status register
+    flash_receive(@status_bits, 1)
+  while status_bits.[0]                                 ' Loop until BUSY bit clear
+
+
+CON ' ==================== PSRAM QSPI DRIVER (DEDICATED COG) ====================
+
+' PSRAM driver runs in its own cog for multi-cog file system support.
+' This solves the pin direction (DIRA/DIRB) issue where inline PASM only
+' affects the caller's cog, causing failures when multiple cogs access PSRAM.
+'
+' Command List Interface:
+'   Each cog has a 3-long slot: [hub_addr, psram_long_addr, long_count]
+'   - hub_addr: Hub RAM byte address for transfer
+'   - psram_long_addr: PSRAM long address (byte_addr >> 2)
+'   - long_count: Number of longs to transfer
+'     - Positive = read (PSRAM -> Hub)
+'     - Negative = write (Hub -> PSRAM)
+'   - Driver clears long_count to 0 when transfer completes
+
+
+PRI psram_start_driver() : started
+'' Start PSRAM driver cog
+'' @returns started - true if started, false if no cog available
+
+  ' NOTE: Do NOT drive pin 49 low - it's part of the PSRAM data bus (SIO1 of chip 2)
+  ' The P2 Edge 32MB uses pins 40-55 for 16-bit parallel PSRAM data
+
+  psram_stop_driver()
+  psramCog := coginit(COGEXEC_NEW, @psram_driver, @psram_cmd_list) + 1
+  return psramCog <> 0
+
+
+PRI psram_stop_driver()
+'' Stop PSRAM driver cog if running
+
+  if psramCog
+    cogstop(psramCog~ - 1)
+
+
+PRI psram_read(psram_address, p_buffer, byte_count) | long_addr, long_count, my_cog, p_cmd
+'' Read bytes from PSRAM via dedicated driver cog
+'' @param psram_address - PSRAM byte address (0 to 32MB-1)
+'' @param p_buffer - hub destination buffer
+'' @param byte_count - bytes to read (must be multiple of 4)
+
+  ' Convert to long address and count
+  long_addr := psram_address >> 2
+  long_count := (byte_count + 3) >> 2
+
+  ' Get pointer to this cog's command slot
+  my_cog := cogid()
+  p_cmd := @psram_cmd_list + (my_cog * 12)
+
+  ' Issue command: positive count = read
+  LONG[p_cmd][0] := p_buffer
+  LONG[p_cmd][1] := long_addr
+  LONG[p_cmd][2] := long_count                          ' Positive = read
+
+  ' Wait for completion (driver clears count to 0)
+  repeat while LONG[p_cmd][2]
+
+
+PRI psram_write(psram_address, p_buffer, byte_count) | long_addr, long_count, my_cog, p_cmd
+'' Write bytes to PSRAM via dedicated driver cog
+'' @param psram_address - PSRAM byte address (0 to 32MB-1)
+'' @param p_buffer - hub source buffer
+'' @param byte_count - bytes to write (must be multiple of 4)
+
+  ' Convert to long address and count
+  long_addr := psram_address >> 2
+  long_count := (byte_count + 3) >> 2
+
+  ' Get pointer to this cog's command slot
+  my_cog := cogid()
+  p_cmd := @psram_cmd_list + (my_cog * 12)
+
+  ' Issue command: negative count = write
+  LONG[p_cmd][0] := p_buffer
+  LONG[p_cmd][1] := long_addr
+  LONG[p_cmd][2] := -long_count                         ' Negative = write
+
+  ' Wait for completion (driver clears count to 0)
+  repeat while LONG[p_cmd][2]
+
+
+DAT { PSRAM dedicated cog driver }
+
+                org
+
+psram_driver
+'
+' PSRAM Driver - runs in dedicated cog
+' PTRA = pointer to command list in hub (8 cogs x 3 longs)
+'
+' Initialize LUT for nibble expansion ($0000, $1111, $2222, ... $FFFF)
+'
+                mov     pa, #$0000
+                mov     ptrb, #0
+                rep     #2, #16
+                wrlut   pa, ptrb++
+                add     pa, h1111
+
+                drvh    #RAM_CS                         ' CS high (deselected)
+
+                fltl    #RAM_CK                         ' Set CK for transition output
+                wrpin   #%01_00101_0, #RAM_CK           ' P_TRANSITION mode
+                wxpin   #1, #RAM_CK                     ' Base period = 1 clock
+                drvl    #RAM_CK
+
+                or      dirb, dirpat                    ' Make data pins outputs
+
+                setxfrq h40000000                       ' Set 2-clock streamer timebase
+
+                mov     ijmp1, #xfi_isr                 ' Set streamer-finished ISR address
+                setint1 #EVENT_XFI                      ' Enable streamer-finished interrupt
+
+                ' Enter QPI (quad) mode with $35 command
+                mov     xfi, #0                         ' Clear xfi so djnz will wait
+                drvl    #RAM_CS
+                xinit   cmdbit8, #$35 rev 7
+                wypin   #16, #RAM_CK                    ' Start clocks (triggers ISR when done)
+
+.qpi_wait       djnz    xfi, #.qpi_wait                 ' Wait for ISR to set xfi=1
+                                                        ' (xfi=0 -> wraps to $FFFFFFFF, loops until ISR)
+'
+' Command loop - poll all 8 cog slots for commands
+'
+.lod            setq    #8*3-1                          ' Load all 24 longs of command list
+                rdlong  cmd, ptra
+
+.chk0           tjnz    cmd+0*3+2, #.cog0               ' Check each cog for command
+.chk1           tjnz    cmd+1*3+2, #.cog1
+.chk2           tjnz    cmd+2*3+2, #.cog2
+.chk3           tjnz    cmd+3*3+2, #.cog3
+.chk4           tjnz    cmd+4*3+2, #.cog4
+.chk5           tjnz    cmd+5*3+2, #.cog5
+.chk6           tjnz    cmd+6*3+2, #.cog6
+.chk7           tjnz    cmd+7*3+2, #.cog7
+
+                jmp     #.lod                           ' Reload and check again
+
+.cog0           mov     hub, cmd+0*3+0
+                mov     adr, cmd+0*3+1
+                mov     len, cmd+0*3+2
+                callpa  #0*12+8, #.got
+                jmp     #.chk1
+
+.cog1           mov     hub, cmd+1*3+0
+                mov     adr, cmd+1*3+1
+                mov     len, cmd+1*3+2
+                callpa  #1*12+8, #.got
+                jmp     #.chk2
+
+.cog2           mov     hub, cmd+2*3+0
+                mov     adr, cmd+2*3+1
+                mov     len, cmd+2*3+2
+                callpa  #2*12+8, #.got
+                jmp     #.chk3
+
+.cog3           mov     hub, cmd+3*3+0
+                mov     adr, cmd+3*3+1
+                mov     len, cmd+3*3+2
+                callpa  #3*12+8, #.got
+                jmp     #.chk4
+
+.cog4           mov     hub, cmd+4*3+0
+                mov     adr, cmd+4*3+1
+                mov     len, cmd+4*3+2
+                callpa  #4*12+8, #.got
+                jmp     #.chk5
+
+.cog5           mov     hub, cmd+5*3+0
+                mov     adr, cmd+5*3+1
+                mov     len, cmd+5*3+2
+                callpa  #5*12+8, #.got
+                jmp     #.chk6
+
+.cog6           mov     hub, cmd+6*3+0
+                mov     adr, cmd+6*3+1
+                mov     len, cmd+6*3+2
+                callpa  #6*12+8, #.got
+                jmp     #.chk7
+
+.cog7           mov     hub, cmd+7*3+0
+                mov     adr, cmd+7*3+1
+                mov     len, cmd+7*3+2
+                callpa  #7*12+8, #.got
+                jmp     #.chk0
+
+.got            mov     zip, pa                         ' Got command - save offset
+                add     zip, ptra                       ' zip = hub address of len field
+
+                mov     xfi, #1                         ' Set transfer-finished flag
+
+                call    #block                          ' Perform r/w
+
+                djnz    xfi, #$                         ' Wait for CS high (xfi = 1)
+
+                wrlong  #0, zip                         ' Signal completion by clearing len
+
+                setq    #8*3-1                          ' Reload command list
+        _ret_   rdlong  cmd, ptra
+'
+' Block r/w with page boundary handling
+' hub = hub address, adr = PSRAM long address, len.[31] = write flag
+'
+block           abs     len             wc              ' Get write flag into C, clear MSB
+
+        if_nc   mov     prw, #.rd                       ' Read?
+        if_nc   wrfast  h80000000, hub
+        if_c    mov     prw, #.wr                       ' Write?
+        if_c    rdfast  h80000000, hub
+                bitnc   cmdrw, #30                      ' Set r/w bit in streamer command
+
+                mov     fin, adr                        ' Calculate final address
+                add     fin, len
+
+                mov     pag, adr                        ' Get initial page start
+                andn    pag, h3FF
+
+.lp             add     pag, h400                       ' Get next page boundary
+
+                cmp     fin, pag        wcz
+        if_be   mov     len, fin                        ' If within page, last transfer
+        if_a    mov     len, pag                        ' If beyond page, partial transfer
+                sub     len, adr
+
+        if_be   jmp     prw                             ' If last, jmp and exit
+                call    prw                             ' Otherwise call and loop
+                mov     adr, pag                        ' Set address to next page
+                jmp     #.lp
+'
+' Read operation
+'
+.rd             mov     pa, #$BE                        ' $EB (Fast Read Quad) nibble-reversed
+                callpb  #8+5, #.start                   ' Start with 13 base clocks (8 cmd + 5 dummy)
+                setq    h80000000                       ' 1-clock mode for precise timing
+                xcont   cmdnibn, #0                     ' Queue dummy cycles
+                setq    h40000000                       ' 2-clock mode for data
+                xcont   cmdrw, #0                       ' Queue data input, triggers ISR when done
+        _ret_   andn    dirb, dirpat                    ' Make data pins inputs (on 9th ck rise)
+'
+' Write operation
+'
+.wr             mov     pa, #$83                        ' $38 (Quad Page Program) nibble-reversed
+                callpb  #8, #.start                     ' Start with 8 base clocks (cmd only)
+        _ret_   xcont   cmdrw, #0                       ' Queue data output, triggers ISR when done
+'
+' Start read/write operation - setup command and address
+'
+.start          rolnib  pa, adr, #0                     ' Build nibble-reversed address
+                rolnib  pa, adr, #1
+                rolnib  pa, adr, #2
+                rolnib  pa, adr, #3
+                rolnib  pa, adr, #4
+                rolnib  pa, adr, #5
+                rol     pa, #8
+
+                shl     len, #1                         ' Convert longs to words
+                setword cmdrw, len, #0                  ' Set word count in r/w command
+
+                djnz    xfi, #$                         ' Wait for previous CS high (xfi = 1)
+
+                add     pb, len                         ' pb = base_clocks + words
+                shl     pb, #1                          ' pb = transitions (16 cycles @ 320MHz = 50ns)
+
+                drvl    #RAM_CS                         ' CS low (CS high >= 50ns at 320MHz)
+                xinit   cmdnib8, pa                     ' Start command + address
+        _ret_   wypin   pb, #RAM_CK                     ' Start clock pulses
+'
+' Constants
+'
+h80000000       long    $80000000
+h40000000       long    $40000000
+h1111           long    $1111
+h400            long    $400                            ' Page size (1024 longs)
+h3FF            long    $3FF                            ' Page mask
+
+dirpat          long    _RAM_DIRPAT
+cmdbit8         long    _RAM_CMDBIT8
+cmdnib8         long    _RAM_CMDNIB8
+cmdnibn         long    _RAM_CMDNIBN
+cmdrw           long    _RAM_CMDRW
+'
+' Streamer-finished ISR
+'
+xfi_isr         drvh    #RAM_CS                         ' CS high
+                or      dirb, dirpat                    ' Make data pins outputs
+                mov     xfi, #1                         ' Set transfer-finished flag
+                reti1
+'
+' Variables
+'
+cmd             res     8*3                             ' Command list copy from hub
+hub             res     1
+adr             res     1
+len             res     1
+prw             res     1
+fin             res     1
+pag             res     1
+xfi             res     1
+zip             res     1
+
+                fit     $1F0
+
+{{
+
+  MIT License
+
+  Copyright (c) 2026 Iron Sheep Productions, LLC
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+}}

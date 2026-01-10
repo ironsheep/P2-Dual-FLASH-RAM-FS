@@ -1,0 +1,699 @@
+{{
+================================================================================
+  dir_fs.spin2 - Directory/Path Wrapper for flash_fs or flash_ram_fs
+
+  This wrapper adds virtual directory support and path resolution to the
+  underlying flat file system. Works with either flash_fs.spin2 (F: only)
+  or flash_ram_fs.spin2 (F: + R:).
+
+  Features:
+  - Virtual directories via path prefixes
+  - Super-root mode showing available drives
+  - Path resolution (. and ..)
+  - Current directory tracking
+  - Cross-device navigation
+
+  Usage:
+    OBJ
+      fs : "flash_ram_fs"
+      dir : "dir_fs"
+
+    PUB main()
+      fs.mount()
+      dir.init(@fs)
+      dir.chdir("F:")                    ' Change to Flash root
+      dir.mkdir("logs/2024")             ' Create nested virtual directory
+      dir.chdir("logs/2024")
+      handle := dir.open("data.txt", "w") ' Creates "logs/2024/data.txt"
+
+  Author: Iron Sheep Productions, LLC
+  Created: 2026-01-08
+================================================================================
+}}
+
+CON ' --- Drive and Path Constants ---
+
+  ' Drive identifiers (matching flash_ram_fs.spin2)
+  DRIVE_NONE       = 0                                  ' Super-root state (no drive selected)
+  DRIVE_F          = 1                                  ' Flash drive
+  DRIVE_R          = 2                                  ' RAM drive
+
+  ' Path limits
+  MAX_PATH_LEN     = 127                                ' Maximum path length
+  MAX_FILENAME_LEN = 127                                ' Maximum filename length
+  MAX_DIR_DEPTH    = 8                                  ' Maximum directory depth
+
+  ' Error codes (extending flash_ram_fs error codes)
+  SUCCESS          = 0
+  E_PATH_TOO_LONG  = -30                                ' Path exceeds MAX_PATH_LEN
+  E_INVALID_PATH   = -31                                ' Malformed path
+  E_NO_FS          = -32                                ' Filesystem not initialized
+  E_DIR_NOT_EMPTY  = -33                                ' Directory contains files
+
+
+VAR ' --- Instance State ---
+
+  LONG  pFS                                             ' Pointer to underlying filesystem object
+  BYTE  currentDrive                                    ' Current drive (DRIVE_NONE, DRIVE_F, DRIVE_R)
+  BYTE  currentDir[MAX_PATH_LEN + 1]                    ' Current directory path (without drive)
+
+
+PUB init(p_filesystem)
+'' Initialize directory wrapper with underlying filesystem
+'' @param p_filesystem - pointer to flash_fs or flash_ram_fs object
+
+  pFS := p_filesystem
+  currentDrive := DRIVE_NONE                            ' Start in super-root
+  bytefill(@currentDir, 0, MAX_PATH_LEN + 1)            ' Clear current directory
+
+
+PUB get_current_drive() : drive
+'' Get current drive
+'' @returns drive - DRIVE_NONE, DRIVE_F, or DRIVE_R
+
+  return currentDrive
+
+
+PUB get_current_dir(p_buffer, max_len)
+'' Get current directory path
+'' @param p_buffer - destination buffer for path
+'' @param max_len - buffer size
+
+  strncopy(p_buffer, @currentDir, max_len)
+
+
+PUB get_full_path(p_buffer, max_len) | len
+'' Get full path including drive letter
+'' @param p_buffer - destination buffer
+'' @param max_len - buffer size
+
+  if currentDrive == DRIVE_NONE
+    if max_len > 0
+      BYTE[p_buffer] := 0
+    return
+
+  ' Add drive prefix
+  if currentDrive == DRIVE_F
+    if max_len >= 3
+      BYTE[p_buffer][0] := "F"
+      BYTE[p_buffer][1] := ":"
+      BYTE[p_buffer][2] := 0
+  else
+    if max_len >= 3
+      BYTE[p_buffer][0] := "R"
+      BYTE[p_buffer][1] := ":"
+      BYTE[p_buffer][2] := 0
+
+  ' Append current directory
+  if currentDir[0]
+    len := strsize(p_buffer)
+    if len < max_len - 1
+      strncopy(p_buffer + len, @currentDir, max_len - len)
+
+
+CON ' --- Path Utilities ---
+
+
+PUB is_absolute_path(p_path) : bool | c0, c1
+'' Check if path is absolute (starts with drive letter or /)
+'' @param p_path - path to check
+'' @returns bool - true if absolute
+
+  c0 := BYTE[p_path]
+  c1 := BYTE[p_path + 1]
+
+  ' Check for drive letter (F: or R:)
+  if (c0 == "F" or c0 == "f" or c0 == "R" or c0 == "r") and c1 == ":"
+    return true
+
+  ' Check for root slash
+  if c0 == "/"
+    return true
+
+  return false
+
+
+PUB parse_drive_from_path(p_path) : drive, p_remainder | c0, c1
+'' Extract drive letter from path
+'' @param p_path - path to parse
+'' @returns drive - DRIVE_F, DRIVE_R, or DRIVE_NONE
+'' @returns p_remainder - pointer to rest of path after drive
+
+  c0 := BYTE[p_path]
+  c1 := BYTE[p_path + 1]
+
+  ' Check for F: or f:
+  if (c0 == "F" or c0 == "f") and c1 == ":"
+    return DRIVE_F, p_path + 2
+
+  ' Check for R: or r:
+  if (c0 == "R" or c0 == "r") and c1 == ":"
+    return DRIVE_R, p_path + 2
+
+  ' No drive letter
+  return DRIVE_NONE, p_path
+
+
+PUB normalize_path(p_path, p_result, max_len) : status | src_idx, dst_idx, component_start, component_len, c
+'' Normalize path by resolving . and .. components
+'' @param p_path - source path
+'' @param p_result - destination buffer
+'' @param max_len - destination buffer size
+'' @returns status - SUCCESS or error
+
+  if strsize(p_path) > max_len
+    return E_PATH_TOO_LONG
+
+  src_idx := 0
+  dst_idx := 0
+  component_start := 0
+
+  repeat
+    c := BYTE[p_path + src_idx]
+
+    if c == "/" or c == 0
+      component_len := src_idx - component_start
+
+      if component_len == 1 and BYTE[p_path + component_start] == "."
+        ' "." - skip (current directory)
+
+      elseif component_len == 2 and BYTE[p_path + component_start] == "." and BYTE[p_path + component_start + 1] == "."
+        ' ".." - go up one level
+        if dst_idx > 0
+          dst_idx--                                     ' Back over trailing slash
+          repeat while dst_idx > 0 and BYTE[p_result + dst_idx - 1] <> "/"
+            dst_idx--
+
+      elseif component_len > 0
+        ' Normal component - copy it
+        if dst_idx > 0 and BYTE[p_result + dst_idx - 1] <> "/"
+          if dst_idx < max_len
+            BYTE[p_result + dst_idx++] := "/"
+        repeat component_len with src_idx
+          if dst_idx < max_len
+            BYTE[p_result + dst_idx++] := BYTE[p_path + component_start + src_idx]
+
+      component_start := src_idx + 1
+
+    if c == 0
+      quit
+    src_idx++
+
+  ' Null terminate
+  if dst_idx <= max_len
+    BYTE[p_result + dst_idx] := 0
+
+  return SUCCESS
+
+
+PUB join_path(p_base, p_relative, p_result, max_len) : status | base_len
+'' Join base path with relative path
+'' @param p_base - base directory path
+'' @param p_relative - relative path to append
+'' @param p_result - destination buffer
+'' @param max_len - buffer size
+'' @returns status - SUCCESS or error
+
+  base_len := strsize(p_base)
+
+  if base_len + 1 + strsize(p_relative) > max_len
+    return E_PATH_TOO_LONG
+
+  ' Copy base
+  strcopy(p_result, p_base, max_len)
+
+  ' Add separator if needed
+  if base_len > 0 and BYTE[p_base + base_len - 1] <> "/"
+    BYTE[p_result + base_len] := "/"
+    base_len++
+
+  ' Append relative
+  strcopy(p_result + base_len, p_relative, max_len - base_len)
+
+  return SUCCESS
+
+
+PUB split_path(p_path, p_dir, dir_max, p_filename, fn_max) | len, last_slash, i
+'' Split path into directory and filename components
+'' @param p_path - full path
+'' @param p_dir - buffer for directory part
+'' @param dir_max - directory buffer size
+'' @param p_filename - buffer for filename part
+'' @param fn_max - filename buffer size
+
+  len := strsize(p_path)
+  last_slash := -1
+
+  ' Find last slash
+  repeat len with i
+    if BYTE[p_path + i] == "/"
+      last_slash := i
+
+  if last_slash < 0
+    ' No directory component
+    if p_dir and dir_max > 0
+      BYTE[p_dir] := 0
+    if p_filename
+      strncopy(p_filename, p_path, fn_max)
+  else
+    ' Has directory component
+    if p_dir
+      strncopy(p_dir, p_path, last_slash <# dir_max)
+      if last_slash < dir_max
+        BYTE[p_dir + last_slash] := 0
+    if p_filename
+      strncopy(p_filename, p_path + last_slash + 1, fn_max)
+
+
+PUB build_full_path(p_relative, p_result, max_len) : status | drive, p_path_part, temp_path[32]
+'' Build full path from relative path using current drive and directory
+'' @param p_relative - relative or absolute path
+'' @param p_result - destination buffer
+'' @param max_len - buffer size
+'' @returns status - SUCCESS or error
+
+  ' Check if path is absolute
+  if is_absolute_path(p_relative)
+    ' Already absolute - just normalize
+    return normalize_path(p_relative, p_result, max_len)
+
+  ' Build path from current location
+  if currentDrive == DRIVE_NONE
+    return E_INVALID_PATH                               ' Can't resolve relative path without current drive
+
+  ' Start with drive prefix
+  if currentDrive == DRIVE_F
+    BYTE[p_result][0] := "F"
+  else
+    BYTE[p_result][0] := "R"
+  BYTE[p_result][1] := ":"
+  BYTE[p_result][2] := 0
+
+  ' Append current directory
+  if currentDir[0]
+    status := join_path(p_result, @currentDir, p_result, max_len)
+    if status < 0
+      return status
+
+  ' Append relative path
+  status := join_path(p_result, p_relative, @temp_path, 128)
+  if status < 0
+    return status
+
+  ' Normalize the result
+  return normalize_path(@temp_path, p_result, max_len)
+
+
+CON ' --- Directory Navigation ---
+
+
+PUB chdir(p_path) : status | drive, p_remainder, temp_path[32]
+'' Change current directory
+'' @param p_path - new directory path (absolute or relative)
+'' @returns status - SUCCESS or error
+
+  ifnot pFS
+    return E_NO_FS
+
+  ' Parse drive from path
+  drive, p_remainder := parse_drive_from_path(p_path)
+
+  if drive <> DRIVE_NONE
+    ' Absolute path with drive
+    currentDrive := drive
+    ' Normalize the remainder into currentDir
+    if BYTE[p_remainder] == 0 or (BYTE[p_remainder] == "/" and BYTE[p_remainder + 1] == 0)
+      ' Root directory
+      currentDir[0] := 0
+    else
+      status := normalize_path(p_remainder, @currentDir, MAX_PATH_LEN)
+      if status < 0
+        return status
+  else
+    ' Relative path
+    if currentDrive == DRIVE_NONE
+      return E_INVALID_PATH                             ' Can't navigate without drive
+
+    ' Build new path from current + relative
+    status := join_path(@currentDir, p_path, @temp_path, 128)
+    if status < 0
+      return status
+    status := normalize_path(@temp_path, @currentDir, MAX_PATH_LEN)
+    if status < 0
+      return status
+
+  return SUCCESS
+
+
+PUB cdup() : status
+'' Change to parent directory
+'' @returns status - SUCCESS or error
+
+  return chdir(@"..")
+
+
+PUB cdroot() : status
+'' Change to root of current drive
+'' @returns status - SUCCESS or error
+
+  if currentDrive == DRIVE_NONE
+    return E_INVALID_PATH
+
+  currentDir[0] := 0                                    ' Clear current directory
+  return SUCCESS
+
+
+PUB cd_super_root() : status
+'' Change to super-root (no drive selected)
+'' @returns status - SUCCESS
+
+  currentDrive := DRIVE_NONE
+  currentDir[0] := 0
+  return SUCCESS
+
+
+CON ' --- Directory Operations ---
+
+
+PUB getcwd(p_buffer, max_len) : status
+'' Get current working directory (full path with drive)
+'' @param p_buffer - destination buffer
+'' @param max_len - buffer size
+'' @returns status - SUCCESS or error
+
+  get_full_path(p_buffer, max_len)
+  return SUCCESS
+
+
+PUB mkdir(p_path) : status | full_path[32], marker_path[34]
+'' Create virtual directory (via marker file)
+'' @param p_path - directory path to create
+'' @returns status - SUCCESS or error
+
+  ifnot pFS
+    return E_NO_FS
+
+  ' Build full path
+  status := build_full_path(p_path, @full_path, 128)
+  if status < 0
+    return status
+
+  ' Create marker file: path/.d
+  status := join_path(@full_path, @".d", @marker_path, 136)
+  if status < 0
+    return status
+
+  ' Create empty marker file using underlying FS
+  ' The marker indicates this is a directory
+  return create_marker_file(@marker_path)
+
+
+PUB rmdir(p_path) : status | full_path[32], marker_path[34]
+'' Remove virtual directory (must be empty)
+'' @param p_path - directory path to remove
+'' @returns status - SUCCESS or error
+
+  ifnot pFS
+    return E_NO_FS
+
+  ' Build full path
+  status := build_full_path(p_path, @full_path, 128)
+  if status < 0
+    return status
+
+  ' Check if directory is empty (no files with this prefix)
+  if not is_dir_empty(@full_path)
+    return E_DIR_NOT_EMPTY
+
+  ' Delete marker file
+  status := join_path(@full_path, @".d", @marker_path, 136)
+  if status < 0
+    return status
+
+  return delete_marker_file(@marker_path)
+
+
+PUB listdir(p_path, p_callback) : count | full_path[32], drive, block_id, filename[32], file_size, prefix_len, entry_type
+'' List directory contents
+'' @param p_path - directory path (or NULL for current)
+'' @param p_callback - callback function(p_name, size, is_dir)
+'' @returns count - number of entries found
+
+  ifnot pFS
+    return 0
+
+  ' Handle super-root
+  if currentDrive == DRIVE_NONE and (p_path == 0 or BYTE[p_path] == 0)
+    ' Return virtual drive entries
+    if p_callback
+      p_callback(@"F:", 0, true)
+      p_callback(@"R:", 0, true)
+    return 2
+
+  ' Build full path
+  if p_path and BYTE[p_path]
+    if build_full_path(p_path, @full_path, 128) < 0
+      return 0
+  else
+    get_full_path(@full_path, 128)
+
+  ' Determine drive
+  drive, _ := parse_drive_from_path(@full_path)
+  if drive == DRIVE_NONE
+    return 0
+
+  ' Get prefix for filtering
+  prefix_len := strsize(@full_path)
+  if prefix_len > 2                                     ' Has path after drive
+    prefix_len -= 2                                     ' Skip drive prefix for matching
+
+  ' Iterate underlying filesystem
+  block_id := 0
+  count := 0
+
+  repeat
+    if fs_directory(drive, @block_id, @filename, @file_size) <> 0
+      quit
+
+    if BYTE[@filename] == 0
+      quit
+
+    ' Check if file matches our prefix
+    if starts_with_prefix(@filename, @full_path + 2, prefix_len - 2)
+      ' Extract the next path segment
+      entry_type := extract_next_segment(@filename, prefix_len - 2, @filename, 128)
+      if entry_type >= 0
+        if p_callback
+          p_callback(@filename, file_size, entry_type == 1)
+        count++
+
+  return count
+
+
+PUB exists_dir(p_path) : bool | full_path[32], marker_path[34]
+'' Check if directory exists
+'' @param p_path - directory path
+'' @returns bool - true if exists
+
+  ifnot pFS
+    return false
+
+  ' Build full path to marker
+  if build_full_path(p_path, @full_path, 128) < 0
+    return false
+
+  if join_path(@full_path, @".d", @marker_path, 136) < 0
+    return false
+
+  return fs_exists(@marker_path)
+
+
+CON ' --- File Operations (wrapped) ---
+
+
+PUB open(p_filename, mode) : handle | full_path[32]
+'' Open file using current directory context
+'' @param p_filename - filename (relative or absolute)
+'' @param mode - file mode ("r", "w", "a", etc.)
+'' @returns handle - file handle or error
+
+  ifnot pFS
+    return E_NO_FS
+
+  ' Build full path
+  if build_full_path(p_filename, @full_path, 128) < 0
+    return E_INVALID_PATH
+
+  return fs_open(@full_path, mode)
+
+
+PUB exists(p_filename) : bool | full_path[32]
+'' Check if file exists
+'' @param p_filename - filename (relative or absolute)
+'' @returns bool - true if exists
+
+  ifnot pFS
+    return false
+
+  ' Build full path
+  if build_full_path(p_filename, @full_path, 128) < 0
+    return false
+
+  return fs_exists(@full_path)
+
+
+PUB delete(p_filename) : status | full_path[32]
+'' Delete file
+'' @param p_filename - filename (relative or absolute)
+'' @returns status - SUCCESS or error
+
+  ifnot pFS
+    return E_NO_FS
+
+  ' Build full path
+  status := build_full_path(p_filename, @full_path, 128)
+  if status < 0
+    return status
+
+  return fs_delete(@full_path)
+
+
+CON ' --- Internal Filesystem Interface ---
+
+
+PRI create_marker_file(p_path) : status | handle
+'' Create empty marker file
+  handle := fs_open(p_path, "w")
+  if handle >= 0
+    fs_close(handle)
+    return SUCCESS
+  return handle
+
+
+PRI delete_marker_file(p_path) : status
+'' Delete marker file
+  return fs_delete(p_path)
+
+
+PRI is_dir_empty(p_prefix) : bool | drive, block_id, filename[32], file_size, prefix_len
+'' Check if directory is empty (no files with prefix)
+  drive, _ := parse_drive_from_path(p_prefix)
+  prefix_len := strsize(p_prefix) - 2                   ' Skip drive prefix
+
+  block_id := 0
+  repeat
+    if fs_directory(drive, @block_id, @filename, @file_size) <> 0
+      quit
+    if BYTE[@filename] == 0
+      quit
+    if starts_with_prefix(@filename, p_prefix + 2, prefix_len)
+      ' Skip the marker file itself
+      if not ends_with(@filename, @".d")
+        return false
+
+  return true
+
+
+PRI starts_with_prefix(p_str, p_prefix, prefix_len) : bool | i
+'' Check if string starts with prefix
+  if prefix_len == 0
+    return true
+
+  repeat prefix_len with i
+    if BYTE[p_str + i] <> BYTE[p_prefix + i]
+      return false
+    if BYTE[p_str + i] == 0
+      return false
+
+  return true
+
+
+PRI ends_with(p_str, p_suffix) : bool | str_len, suf_len
+'' Check if string ends with suffix
+  str_len := strsize(p_str)
+  suf_len := strsize(p_suffix)
+
+  if suf_len > str_len
+    return false
+
+  return strcomp(p_str + str_len - suf_len, p_suffix)
+
+
+PRI extract_next_segment(p_full, prefix_len, p_result, max_len) : entry_type | i, c, seg_len
+'' Extract next path segment after prefix
+'' @returns entry_type - 0=file, 1=directory, -1=no more
+  ' Skip prefix
+  repeat prefix_len
+    if BYTE[p_full]
+      p_full++
+
+  ' Skip leading slash
+  if BYTE[p_full] == "/"
+    p_full++
+
+  if BYTE[p_full] == 0
+    return -1
+
+  ' Find end of segment
+  seg_len := 0
+  repeat
+    c := BYTE[p_full + seg_len]
+    if c == 0 or c == "/"
+      quit
+    seg_len++
+
+  ' Copy segment
+  if seg_len >= max_len
+    seg_len := max_len - 1
+  repeat seg_len with i
+    BYTE[p_result + i] := BYTE[p_full + i]
+  BYTE[p_result + seg_len] := 0
+
+  ' Determine if file or directory
+  if BYTE[p_full + seg_len] == "/"
+    return 1                                            ' Directory
+  return 0                                              ' File
+
+
+CON ' --- Filesystem Method Dispatch ---
+'' These methods dispatch to the underlying filesystem object
+
+
+PRI fs_open(p_path, mode) : handle
+'' Call underlying FS open()
+  ' Note: In real implementation, use method pointer call
+  ' For now, assume pFS points to flash_ram_fs
+  return LONG[pFS][0](p_path, mode)                     ' Placeholder
+
+
+PRI fs_close(handle) : status
+'' Call underlying FS close()
+  return LONG[pFS][1](handle)                           ' Placeholder
+
+
+PRI fs_delete(p_path) : status
+'' Call underlying FS delete()
+  return LONG[pFS][2](p_path)                           ' Placeholder
+
+
+PRI fs_exists(p_path) : bool
+'' Call underlying FS exists()
+  return LONG[pFS][3](p_path)                           ' Placeholder
+
+
+PRI fs_directory(drive, p_block_id, p_filename, p_size) : status
+'' Call underlying FS directory()
+  return LONG[pFS][4](drive, p_block_id, p_filename, p_size)  ' Placeholder
+
+
+CON ' --- Helper Functions ---
+
+
+PRI strncopy(p_dest, p_src, max_len) | i
+'' Copy string with length limit
+  repeat max_len - 1 with i
+    if BYTE[p_src + i] == 0
+      quit
+    BYTE[p_dest + i] := BYTE[p_src + i]
+  BYTE[p_dest + i] := 0
+

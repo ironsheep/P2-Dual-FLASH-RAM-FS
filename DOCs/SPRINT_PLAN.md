@@ -617,6 +617,198 @@ VAR
 
 ---
 
+## Development Tooling
+
+### Background: Why run_test.sh Exists
+
+Running P2 tests involves a complex multi-process orchestration:
+
+1. **Compile** (foreground): `pnut-ts -d` compiles with DEBUG support, generating `.bin`
+2. **Download** (foreground UI): `pnut-term-ts -r` downloads to RAM and runs
+3. **Capture**: As the P2 executes, DEBUG output streams back over serial and is logged automatically to `./logs/debug_*.log`
+4. **Monitor** (background): Watch the log for `END_SESSION` marker indicating test completion
+5. **Terminate**: Kill the downloader when marker found OR timeout expires
+6. **Evaluate**: Parse the log file for test results
+
+**The Problem**: When Claude Code ran these steps manually:
+- Background monitor tasks became orphaned
+- Unclear when the downloader actually terminated
+- Process cleanup was inconsistent
+- After 2-3 test runs, the environment became confused with zombie processes
+
+**The Solution**: `run_test.sh` encapsulates all orchestration:
+- Single foreground command with predictable behavior
+- Automatic process cleanup via trap handlers
+- Clear exit codes for pass/fail/timeout
+- No orphaned processes
+- Claude Code just runs one command and checks the exit code
+
+### Workflow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     run_test.sh <test> <dir> -t <sec>           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. COMPILE (foreground)                                        │
+│     pnut-ts -d test.spin2  ──►  test.bin                        │
+│                                                                 │
+│  2. DOWNLOAD & RUN (foreground, but script manages)             │
+│     pnut-term-ts -r test.bin  ──►  P2 executes                  │
+│                                    │                            │
+│                                    ▼                            │
+│  3. CAPTURE (automatic)        DEBUG output ──► logs/debug_*.log│
+│                                    │                            │
+│  4. MONITOR (background)           │                            │
+│     Watch log for END_SESSION ◄────┘                            │
+│           │                                                     │
+│           ├── Found? ──► Kill downloader ──► Exit 0 (PASS)      │
+│           │                                                     │
+│  5. TIMEOUT (background)                                        │
+│     Sleep <sec> ──► Kill downloader ──► Exit 3 (TIMEOUT)        │
+│                                                                 │
+│  6. CLEANUP (trap on EXIT)                                      │
+│     Kill all child processes, no orphans                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Overview
+
+The project uses TypeScript-based tools for compilation and testing:
+
+| Tool | Purpose | Installation |
+|------|---------|--------------|
+| `pnut-ts` | Spin2/PASM2 compiler | `npm install -g pnut-ts` |
+| `pnut-term-ts` | Download, run, and DEBUG terminal | `npm install -g pnut-term-ts` |
+| `run_test.sh` | Automated test runner | `tools/run_test.sh` |
+
+### pnut-ts Compiler
+
+**Usage**: `pnut-ts [options] filename.spin2`
+
+**Key Options**:
+```
+-d, --debug       Compile with DEBUG support (required for test output)
+-l, --list        Generate listing file (.lst)
+-m, --map         Generate memory map file (.map)
+-o, --output      Specify output file basename
+-q, --quiet       Suppress banner and non-error text
+-I, --Include     Add preprocessor include directories
+```
+
+**Examples**:
+```bash
+# Compile with DEBUG support
+pnut-ts -d mytest.spin2
+
+# Compile with listing and map files
+pnut-ts -d -l -m mytest.spin2
+
+# Compile with include path
+pnut-ts -d -I ../src mytest.spin2
+```
+
+### pnut-term-ts Downloader/Terminal
+
+**Usage**: `pnut-term-ts [options]`
+
+**Key Options**:
+```
+-r, --ram <file>       Download to RAM and run
+-f, --flash <file>     Download to FLASH and run
+-p, --plug <device>    Specify PropPlug device node
+-b, --debugbaud <rate> Set debug baud rate (default 2000000)
+-n, --dvcnodes         List available USB serial devices
+-q, --quiet            Suppress banner and non-error text
+--ide                  IDE mode for VSCode integration
+```
+
+**Examples**:
+```bash
+# Download to RAM (auto-detects single PropPlug)
+pnut-term-ts -r mytest.bin
+
+# List available PropPlug devices
+pnut-term-ts -n
+
+# Download to specific PropPlug
+pnut-term-ts -r mytest.bin -p P9cektn7
+
+# IDE mode for automation
+pnut-term-ts --ide -r mytest.bin
+```
+
+**Debug Output**: The terminal captures DEBUG output from the P2 and writes to log files in `./logs/debug_*.log`.
+
+### run_test.sh - Automated Test Runner
+
+**Location**: `tools/run_test.sh`
+
+**Usage**: `./tools/run_test.sh <basename> <srcdir> -t <timeout> [-m] [-l]`
+
+**Arguments**:
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `basename` | Yes | Source file name without .spin2 extension |
+| `srcdir` | Yes | Directory containing the source file |
+| `-t <sec>` | Yes | Timeout in seconds |
+| `-m` | No | Generate memory map file |
+| `-l` | No | Generate listing file |
+
+**Exit Codes**:
+| Code | Meaning |
+|------|---------|
+| 0 | Test PASSED (END_SESSION found in log) |
+| 1 | Compilation failed |
+| 2 | Download/run failed |
+| 3 | Timeout (END_SESSION not found) |
+| 4 | Usage error |
+
+**How It Works**:
+1. Compiles the .spin2 file with DEBUG enabled
+2. Starts pnut-term-ts to download and run
+3. Monitors `./logs/debug_*.log` for `END_SESSION` marker
+4. Terminates when marker found or timeout expires
+5. Reports pass/fail and shows last 30 lines of log
+
+**Example**:
+```bash
+# Run a test with 60-second timeout
+./tools/run_test.sh RT_performance_benchmark tests -t 60
+
+# Run with listing file generation
+./tools/run_test.sh RT_performance_benchmark tests -t 60 -l -m
+```
+
+**Test File Requirements**:
+- Must output `END_SESSION` via DEBUG when complete
+- Example end-of-test code:
+```spin2
+PUB end_tests()
+  debug("END_SESSION")
+  repeat  ' Halt
+```
+
+### Task 16.25: Validate Test Script
+
+Before running full test suites, validate that the test automation works:
+
+- [ ] Create minimal test file `tests/RT_script_test.spin2`
+  - Just outputs `END_SESSION` via DEBUG
+- [ ] Run: `./tools/run_test.sh RT_script_test tests -t 30`
+- [ ] Verify:
+  - Compilation succeeds
+  - Download succeeds
+  - Log file created in `tests/logs/`
+  - `END_SESSION` detected
+  - Exit code is 0
+- [ ] Document any issues found
+
+**PREREQUISITE**: P2 hardware connected via PropPlug
+
+---
+
 ## Sprint 6: Testing & Optimization
 
 **Goal**: Comprehensive testing and performance tuning
@@ -1126,3 +1318,8 @@ Underlying Flat Storage:          Simulated Hierarchical View:
     - File system locks serialize access anyway
     - Runs inline in calling cog (like Flash driver)
     - Less complexity, lower overhead
+21. **PSRAM Transfer Mode**: Block-based (Option A)
+    - 4KB blocks with command/address per block
+    - Simpler, consistent with Flash model
+    - ~1-2% overhead vs streaming mode - acceptable for most use cases
+    - See `TECHNICAL_DEBT.md` TD-001 for potential streaming optimization

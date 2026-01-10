@@ -1,0 +1,41 @@
+' RT_script_test.spin2 - Minimal test to validate run_test.sh script
+'
+' Purpose: Verify the test automation toolchain works correctly.
+' This test simply outputs END_SESSION via DEBUG and halts.
+'
+' Expected behavior:
+'   1. Compiles successfully with pnut-ts -d
+'   2. Downloads and runs via pnut-term-ts -r
+'   3. DEBUG output captured in logs/debug_*.log
+'   4. run_test.sh detects END_SESSION and exits with code 0
+
+CON
+  _clkfreq = 300_000_000
+
+PUB main() | i
+
+  ' Brief delay to ensure terminal is ready
+  waitms(100)
+
+  ' Output test header
+  debug("===========================================")
+  debug("RT_script_test - Toolchain Validation Test")
+  debug("===========================================")
+  debug(" ")
+
+  ' Simulate some test activity
+  debug("Running minimal test sequence...")
+  repeat i from 1 to 5
+    debug("  Step ", udec(i), " of 5")
+    waitms(50)
+
+  debug(" ")
+  debug("All steps completed successfully.")
+  debug(" ")
+
+  ' Signal test completion - this is what run_test.sh monitors for
+  debug("END_SESSION")
+
+  ' Halt
+  repeat
+

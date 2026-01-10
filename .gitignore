@@ -209,3 +209,11 @@ __marimo__/
 /.todo-mcp
 CLAUDE.md
 /REFERENCE
+/tests/logs
+/tests/tests
+
+# P2 build artifacts
+*.bin
+*.obj
+*.lst
+*.map
